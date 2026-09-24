@@ -7,6 +7,8 @@ __pycache__/
 .idea
 venv
 dist
+native-results/
+native-gpu-telemetry.csv
 
 # produced by `pip install -e .`
 exllamav3_ext.cpython-*.so
