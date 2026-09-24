@@ -221,6 +221,12 @@ The feature is installed but remains opt-in. Benchmark processes and telemetry
 have been stopped, releasing the model's VRAM. No dependency or system settings
 were changed.
 
+Installed-extension smoke checks also passed on both the 4090 D and RTX Pro
+6000 using Qwen's 2560-wide residual operation. An initial 8-wide synthetic
+smoke input hit an existing `hc_apply` host integer-division-by-zero edge case
+(`D / chunks_c` becomes zero); the actual Qwen width is unaffected. That unrelated
+kernel edge case was not changed as part of this prototype.
+
 ## Initial baseline
 
 Physical GPU 2 addressed as `cuda:2` with the default current device measured
