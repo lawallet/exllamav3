@@ -3,7 +3,6 @@
 Baseline/profiling only: this script does not install or enable a native prototype.
 """
 import argparse
-from contextlib import nullcontext
 import hashlib
 import json
 import os
