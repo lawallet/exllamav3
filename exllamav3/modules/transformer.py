@@ -6,6 +6,9 @@ from ..model.config import Config
 from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, MLP, BlockSparseMLP, Linear
 from .hyperconnections import HyperConnection
 from ..util import profile_opt
+import os
+
+_native_qwen_enabled = os.environ.get('EXL3_NATIVE_QWEN_BLOCK', '0') == '1'
 
 class TransformerBlock(Module):
 
@@ -81,6 +84,7 @@ class TransformerBlock(Module):
         return [a, m]
 
     def load(self, device: torch.device, **kwargs):
+        self._native_qwen = None
         super().load(device, **kwargs)
         if self.key_layer_scalar:
             self.layer_scalar_t = self.config.stc.get_tensor(
@@ -110,6 +114,7 @@ class TransformerBlock(Module):
             )
 
     def unload(self):
+        self._native_qwen = None
         super().unload()
         self.layer_scalar_t = None
         self.attn_resid_scalar = None
@@ -140,6 +145,16 @@ class TransformerBlock(Module):
         params: dict,
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
+        # Opt-in boundary around the existing attention/GDN call. Its recurrent,
+        # QSA and paged-KV preparation remains authoritative on both paths.
+        if _native_qwen_enabled:
+            from .native_qwen import get_native_block
+            native = get_native_block(self, x, params)
+            if native is not None:
+                y = native.begin(x)
+                y = self.attn.forward(y, params)
+                native.finish(x, y)
+                return to2(x, out_dtype, self.out_dtype)
 
         export_state = params.get("export_state_layers")
         export_state = export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0

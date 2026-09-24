@@ -61,6 +61,7 @@
 #include "libtorch/gated_rmsnorm.h"
 #include "libtorch/mlp.h"
 #include "libtorch/blocksparse_mlp.h"
+#include "libtorch/qwen_block.h"
 #include "libtorch/dsv4_compressor.h"
 #include "libtorch/dsv4_attn.h"
 #include "dsv4_compress.cuh"
@@ -282,6 +283,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/gated_rmsnorm_bc.h"
     #include "libtorch/mlp_bc.h"
     #include "libtorch/blocksparse_mlp_bc.h"
+    py::class_<BC_QwenBlock>(m, "BC_QwenBlock")
+        .def(py::init<std::vector<at::Tensor>, std::shared_ptr<BC_BlockSparseMLP>, double, double>())
+        .def("begin", &BC_QwenBlock::begin)
+        .def("finish", &BC_QwenBlock::finish);
     #include "libtorch/dsv4_compressor_bc.h"
     #include "libtorch/dsv4_attn_bc.h"
     #include "sam_bc.h"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing_extensions import override
 import os
+import weakref
 import torch
 
 from ..model.config import Config, no_default
@@ -278,6 +279,11 @@ class Qwen4ExpModel(Model):
             ]
 
         self.last_kv_module_idx = len(self.modules) - 1
+        # Trunk-only ownership lets the optional native path reject TP/multi-GPU
+        # and excludes the separately constructed MTP head.
+        for module in self.modules:
+            if isinstance(module, TransformerBlock):
+                module._native_qwen_owner = weakref.ref(self)
 
         # No final model norm: the combine-less mixer collapses the stream stack
         self.modules += [
