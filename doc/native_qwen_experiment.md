@@ -1,5 +1,9 @@
 # Qwen3.8 native orchestration experiment
 
+The sections below retain the original non-MTP experiment. The final
+"Native MTP extension" section describes the current installed build and its
+additional speculative-decoding validation.
+
 ## Recorded environment (2026-09-24)
 
 - Checkout: `6b84a21b6f1e5da3f291b9e1019061f0de788279`, v1.5.1 plus the MSVC `__builtin_popcount` fix only.
@@ -241,3 +245,190 @@ so they establish dispatch counts and ordering, not uninstrumented host idle
 time. The trace confirmed 96 mix, 96 apply, 48 MoE, 36 GDN, and 12 attention
 calls per token. The later lightweight host timings omit record_function and
 Torch profiler and are recorded separately from measured generation throughput.
+
+## Native MTP extension (2026-09-24)
+
+This extension continues from the protected non-MTP checkpoint `90ec653`
+on branch `native-qwen-mtp`. The checkpoint tag, backup branch, Git bundle,
+and tested non-MTP wheel under `dist/checkpoints/native-qwen-90ec653` remain
+unchanged. Core implementation: `38c281f`; parity/benchmark tools: `9a68dc4`.
+
+### Execution trace and original rejection guards
+
+`Qwen4ExpMTPModel.attach_to` borrows the trunk embedding/head and requests the
+trunk final mixer's pre-collapse hidden stack through `export_state_norm_keys`.
+That export occurs in the final `GatedResidual.forward`, outside transformer
+blocks. The MTP component has one full-attention/QSA and MoE block; it has no
+GDN or PLE recurrent layers of its own.
+
+`Generator.iterate_draftmodel_mtp_gen` performs four sequential one-token draft
+forwards. `iterate_gen` then verifies five target positions with
+`recurrent_history=True`. The previous native implementation rejected this
+through four independent conditions: no native owner on the non-trunk MTP
+block, query length other than one, recurrent history, and any norm-state
+export. Its C++ residual and router scratch also had only one row, so removing
+the Python guards alone would have been incorrect.
+
+The original attention/GDN forwards remain in control of cache writes and
+history recording. Model recurrent-state advancement records the query length
+and four history steps. After rejection, `reject_remainder` calls
+`GDNState.rewind`, restoring GDN, convolution and PLE state, then rolls back
+page positions. Fully accepted windows use `rewind(0)` to normalize carried
+history. Rejected KV/QSA suffix bytes need not be erased: page positions define
+the committed prefix and subsequent writes replace the suffix.
+
+After sampling, accepted draft-cache positions are repaired by the existing
+`draft_model.prefill` using the corresponding exported target states. The next
+draft's `mtp_last_hidden` is cloned from the last accepted target hidden state.
+These prefill/repair calls deliberately retain the stock path. End-of-generation
+unused proposals are counted as rejected even when the job simply releases its
+state instead of performing another rewind.
+
+### Implementation and supported scope
+
+`BC_QwenBlock` now owns scratch for its fixed row count, including multi-row
+router outputs, and uses the existing residual, routing and `run_bszN` MoE
+kernels. One-row contexts retain the previous constructor behavior and
+workspace layout. Five-row contexts are separately cached on each block and
+released on load/unload. No GDN, attention, routing, residual or MoE math kernel
+was changed; there is no new graph capture, scheduler or rollback code.
+
+The Python guard recognizes an attached, single-layer Qwen4Exp MTP head and
+target on the same GPU, with batch one. Target verification permits query
+length five with history capacity at least four, one cache-bound recurrent
+state, and exactly the final mixer export. A one-token bootstrap is also
+eligible. The draft path permits one token with the expected target hidden
+shape and no recurrent history/export. Other verification lengths (including
+two through four), TP, cross-GPU components, offloaded MoE, prefill, block-local
+state exports and the previous unsupported options fall back. An older native
+extension without `native_qwen_mtp_max_q_len=5` also falls back for MTP while
+retaining the original non-MTP native path.
+
+Validated configuration: the same Qwen3.8 model, physical GPU 2 mapped to
+logical CUDA 0 by `CUDA_VISIBLE_DEVICES=2,0,1`, 300 W limit, FP16 caches with
+1280 tokens, one active sequence, greedy sampler/seed 1234, four fixed draft
+tokens, dynamic drafting off and n-gram drafting off. The existing
+`EXL3_NATIVE_QWEN_BLOCK=1` flag enables both native paths; it does not itself
+enable MTP in the application.
+
+### Exact parity coverage
+
+`util/check_qwen_mtp.py` drives the real generator for stock and native runs.
+It compares byte hashes of every target and draft block residual, target and
+draft logits, exported hidden states, actual proposal IDs and generated IDs.
+It additionally compares full active-slot GDN/convolution/PLE state and history,
+target and draft KV/QSA tensors (including raw and pooled QSA planes), page
+positions, acceptance counters, and the carried target hidden state. Snapshots
+are taken before/after recurrent rewind, after accepted-token cache repair, and
+before final state release. Cache pages are read in logical order and backing
+storage is zeroed before each correctness run, making unwritten tails defined.
+
+Natural rejection and a separate test-only proposal mutation both run through
+the actual rejection path. Mutation rotates through draft positions; original
+draft logits/proposals and the injected IDs are recorded separately. Tests
+require both accepted tokens and nonzero rewind depth, and independently count
+proposals to check that proposed = accepted + rejected. Tensor hashing and state
+snapshots are absent from the performance runs.
+
+The original 128-step non-MTP parity test and all 17 guard/profiling unit tests
+also pass. The tested context is short; long-context sparse-QSA selection,
+concurrent jobs, other models and other MTP configurations are not validated.
+
+Staged natural parity compared 2,632 events over 128 output tokens and 37
+verification rounds: 148 proposed, 91 accepted and 57 rejected drafts. Rewind
+depths 0/1/2/3/4 occurred 14/8/7/1/7 times. Forced parity compared 2,170 events
+over 64 output tokens and 30 rounds: 120 proposed, 34 accepted and 86 rejected;
+rewind depths 0/1/2/3/4 occurred 1/4/6/9/10 times. Both comparisons were exact.
+These cases exercise every rejection depth and accepted-token commit behavior,
+not merely 100% acceptance.
+
+### Staged MTP performance
+
+The initial staged build produced stock decode rates of 97.31, 84.83 and 96.93
+t/s versus native rates of 103.28, 103.56 and 103.45 t/s: means 93.03 and 103.43
+t/s (+11.2%). The slower second stock run is retained. All six completion
+hashes and acceptance counts matched. This series had no GPU telemetry; the
+installed-build series below is the final measured result. These legacy decode
+rates use `(output_tokens - 1) / time_generate`; effective output throughput
+uses `output_tokens / time_generate` (0.1% higher for 1000-token generations).
+
+### Final installed MTP results
+
+The installed build passed both parity suites again with the same event counts,
+token counts and rewind histograms above. Natural runs used 1,924 native block
+calls and 78 fallbacks; forced runs used 1,560 native calls and 69 fallbacks.
+The non-MTP 128-step exact regression also passed with all 48 native blocks.
+
+| Metric | Stock MTP | Native MTP |
+| --- | ---: | ---: |
+| Effective output t/s, run 1 | 87.37 | 102.51 |
+| Effective output t/s, run 2 | 96.84 | 102.51 |
+| Effective output t/s, run 3 | 95.95 | 102.76 |
+| Mean effective output t/s | 93.39 | 102.59 |
+| Mean total generation seconds | 10.959 | 9.974 |
+| Mean prefill/first-token interval seconds | 0.2234 | 0.2226 |
+| Acceptance rate, every run | 49.85% | 49.85% |
+| Proposed / accepted / rejected drafts, every run | 1336 / 666 / 670 | 1336 / 666 / 670 |
+| Native / fallback block calls, every run | 0 / 17681 | 17368 / 313 |
+| Mean GPU utilization, 1 Hz samples | 65.0% | 71.4% |
+| Mean GPU power draw | 187.2 W | 198.7 W |
+| GPU telemetry samples in measured intervals | 33 | 29 |
+
+Mean effective output throughput improved **9.9%**. Every native run was faster
+than every stock run, but the slow first stock run increases the mean relative
+gain; absolute throughput varies between sessions. The power limit stayed at
+300 W throughout. The 173-token prompt, 1000-token output length, model, device
+mapping, sampler and cache/MTP configuration were identical for all six runs.
+The benchmark counts actual draft proposals independently of acceptance stats.
+
+Each native generation used 16,032 native target block calls (334 five-token
+verification rounds across 48 layers) and 1,336 native draft calls. The 313
+fallback calls consist of 48 target prefill blocks, one draft prefill block,
+and 264 accepted-token draft-cache repair calls. No target verification or
+ordinary draft step silently fell back in this measured configuration.
+
+All six completion SHA-256 hashes were
+`7264d3e6445e1597bf1eca6cd0218f4ad01ace3bfeb76a0cf8c81f8c8037bad7`.
+Full numeric results, including end-to-end throughput, are in
+`native-results/mtp-installed/benchmark.json`; joined GPU metrics are in
+`summary.json`, and telemetry is `native-results/mtp-installed-gpu.csv`.
+The validation/benchmark processes and telemetry collector have stopped;
+physical GPU 2 returned to 19 MiB allocated after completion.
+
+### Build and reproduction
+
+The installed wheel is `exllamav3-1.5.1+nativeqwen.mtp1-cp313-cp313-win_amd64.whl`
+(132,508,408 bytes), SHA-256
+`4e969785cc3c0a32704a16199b7b6c602f6b25ec6bad4a267ffa6375954ef592`.
+It contains SM89 and SM120 code and was built with the existing
+`util/build_native_qwen.bat` workflow (four compiler jobs). All 241 packaged
+Python files match the checkout and the installed extension matches the wheel
+byte for byte. Both imports resolve inside Tabby's site-packages. Python,
+Torch 2.9.0+cu128, CUDA 12.8, Triton and FLA were unchanged; the before/after
+pip freeze differs only in ExLlama's local wheel reference.
+
+Reproduce in PowerShell using the existing Tabby environment:
+
+```powershell
+$env:CUDA_VISIBLE_DEVICES='2,0,1'
+& D:\tabbyAPI\venv\Scripts\python.exe -u util\profile_qwen_mtp.py --model D:\tabbyAPI\models\Qwen3.8-Flash-Next-Uncensored-exl3-4bpw --installed --output native-results\mtp-installed
+& D:\tabbyAPI\venv\Scripts\python.exe util\summarize_qwen_ab.py native-results\mtp-installed --telemetry native-results\mtp-installed-gpu.csv
+```
+
+The runner performs non-MTP, natural-MTP and forced-rejection parity before
+warming both paths and alternating stock/native, native/stock, stock/native
+1000-token generations. Lightweight call/proposal counters run in both timed
+paths. External `nvidia-smi` telemetry uses one-second samples; those samples
+include the short prefill interval. Raw data lives under
+`native-results/mtp-{staged,installed}`. The recorded `revision` is the base
+checkpoint because the tests started before committing the working tree;
+the final wheel hash above and implementation commits identify the actual build.
+
+To restore the protected non-MTP build without changing dependencies:
+
+```powershell
+& D:\tabbyAPI\venv\Scripts\python.exe -m pip install --no-deps --force-reinstall D:\exllamav3\dist\checkpoints\native-qwen-90ec653\exllamav3-1.5.1-cp313-cp313-win_amd64.whl
+```
+
+`util/rollback_exllamav3.ps1` remains available for restoring the original
+official wheel instead.
