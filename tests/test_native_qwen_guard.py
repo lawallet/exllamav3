@@ -60,7 +60,8 @@ class TestGuard(unittest.TestCase):
 
     def get(self, params=None, x=None):
         with patch.object(n, 'ext', SimpleNamespace(BC_QwenBlock=lambda *args: self.sentinel,
-                          native_qwen_mtp_max_q_len=getattr(self, 'max_rows', 0))), \
+                          native_qwen_mtp_max_q_len=getattr(self, 'max_rows', 0),
+                          native_qwen_max_batch=getattr(self, 'max_batch', 0))), \
              patch.object(n, '_gate_t'):
             return n.get_native_block(self.block, x or Input(), params or {})
 
@@ -153,6 +154,58 @@ class TestMTPGuard(TestGuard):
         self.max_rows = 0
         self.assertIsNone(self.get(self.params, self.verify))
         self.assertIs(self.get(), self.sentinel)  # Existing non-MTP native path survives.
+
+
+class TestConcurrentGuard(TestMTPGuard):
+    def setUp(self):
+        super().setUp()
+        self.max_batch = 4
+
+    def batch(self, b, q=1):
+        x = Input(); x.shape = (b,q,4,2560)
+        params = dict(cache=self.cache, block_table=SimpleNamespace(ndim=2,shape=(b,16)),
+                      cache_seqlens=SimpleNamespace(shape=(b,)),
+                      recurrent_states=[SimpleNamespace(slot=i,cache=self.cache,exported=False) for i in range(b)])
+        return x,params
+
+    def test_batch_rows_and_dynamic_shapes(self):
+        for b in (4,3,2,3,4):
+            x,p=self.batch(b)
+            self.assertIs(self.get(p,x),self.sentinel)
+
+    def test_batch_ownership_contract(self):
+        x,p=self.batch(2)
+        p['recurrent_states'][1].slot=0
+        self.assertIsNone(self.get(p,x))
+        p['recurrent_states'][1].slot=1
+        p['recurrent_states'][1].cache=object()
+        self.assertIsNone(self.get(p,x))
+        x,p=self.batch(2)
+        p['block_table'].shape=(1,16)
+        self.assertIsNone(self.get(p,x))
+        for b in (0,5,8):
+            x,p=self.batch(b)
+            self.assertIsNone(self.get(p,x))
+
+    def test_concurrent_mtp_boundary(self):
+        for b in (2,3,4):
+            x,p=self.batch(b,5)
+            p.update(export_state_norm_keys={'trunk.final_mixer'}, recurrent_history=True)
+            self.assertIsNone(self.get(p,x))
+        self.block._native_qwen_owner=weakref.ref(self.draft)
+        for b in (2,3):
+            x,p=self.batch(b)
+            p['target_hidden']=SimpleNamespace(shape=(b,1,10240))
+            self.assertIs(self.get(p,x),self.sentinel)
+        x,p=self.batch(4)
+        p['target_hidden']=SimpleNamespace(shape=(4,1,10240))
+        self.assertIsNone(self.get(p,x))
+
+    def test_previous_extension_batch_fallback(self):
+        self.max_batch=0
+        x,p=self.batch(2)
+        self.assertIsNone(self.get(p,x))
+        self.assertIs(self.get(),self.sentinel)
 
 
 if __name__ == '__main__':

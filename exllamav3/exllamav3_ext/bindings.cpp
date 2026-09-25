@@ -289,6 +289,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         .def("begin", &BC_QwenBlock::begin)
         .def("finish", &BC_QwenBlock::finish);
     m.attr("native_qwen_mtp_max_q_len") = 5;
+    m.attr("native_qwen_max_batch") = 4;
     #include "libtorch/dsv4_compressor_bc.h"
     #include "libtorch/dsv4_attn_bc.h"
     #include "sam_bc.h"

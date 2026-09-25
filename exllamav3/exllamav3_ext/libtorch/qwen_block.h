@@ -1,7 +1,7 @@
 #pragma once
 #include "blocksparse_mlp.h"
 
-// Experimental batch-one Qwen4Exp orchestration. Attention retains its existing
+// Experimental small-row Qwen4Exp orchestration. Attention retains its existing
 // Python cache/state preparation; begin/finish own only stateless residual/MoE work.
 struct BC_QwenBlock
 {

@@ -37,11 +37,14 @@ def _mtp_eligible(owner, x, params):
     if is_draft:
         hidden = params.get('target_hidden')
         return (x.shape[1] == 1 and not history and export is None and hidden is not None and
-                tuple(hidden.shape) == (1, 1, x.shape[2] * x.shape[3]))
+                x.shape[0] <= 3 and
+                tuple(hidden.shape) == (x.shape[0], 1, x.shape[2] * x.shape[3]))
     expected = {target.modules[target.logit_layer_idx - 1].key}
     # The supported generator configuration drafts four tokens: a one-token
     # bootstrap or a five-token verification. Shortened/different windows fall back.
-    if export != expected or x.shape[1] not in (1, 5):
+    # Multi-job verification is 10/15 rows. Stock switches residual mixing and
+    # MoE kernel families above eight rows; keep the entire block stock there.
+    if x.shape[0] != 1 or export != expected or x.shape[1] not in (1, 5):
         return False
     if x.shape[1] > 1 and not history:
         return False
@@ -51,15 +54,40 @@ def _mtp_eligible(owner, x, params):
             not states[0].exported and cache.max_history >= x.shape[1] - 1)
 
 
+def _batch_eligible(owner, x, params):
+    """Serialized generator batching, with one paged-cache row per sequence.
+
+    Scratch is indexed by flattened row and consumed before the next block on
+    the same stream. This does not authorize simultaneous model.forward calls
+    from independent threads/streams (the stock runtime shares scratch too).
+    """
+    batch = x.shape[0]
+    if (batch not in (2, 3, 4) or x.shape[1] != 1 or
+        getattr(ext, 'native_qwen_max_batch', 0) < batch):
+        return False
+    table, lengths, cache = (params.get(k) for k in ('block_table', 'cache_seqlens', 'cache'))
+    if (cache is None or table is None or lengths is None or
+        table.ndim != 2 or table.shape[0] != batch or tuple(lengths.shape) != (batch,)):
+        return False
+    if owner.caps.get('mtp_draft'):
+        return True  # Attachment/hidden-state contract is checked by _mtp_eligible.
+    states = params.get('recurrent_states')
+    return (states is not None and len(states) == batch and
+            all(s.cache is cache and not s.exported for s in states) and
+            len({s.slot for s in states}) == batch)
+
+
 def get_native_block(block, x, params):
     owner_ref = getattr(block, '_native_qwen_owner', None)
     owner = owner_ref() if owner_ref else None
     if (owner is None or owner.loaded_tp or
-        not hasattr(ext, 'BC_QwenBlock') or x.ndim != 4 or x.shape[0] != 1 or
+        not hasattr(ext, 'BC_QwenBlock') or x.ndim != 4 or x.shape[0] < 1 or
         x.dtype != torch.float32 or not x.is_cuda or not x.is_contiguous() or
         any(k in params for k in ('capture', 'quant_preserve', 'backend', 'export_state_layers',
                                   'activate_all_experts', 'loras')) or
         any(params.get(k) for k in ('prefill', 'tp_warmup', 'autosplit_measure', 'layer_instance'))):
+        return None
+    if x.shape[0] != 1 and not _batch_eligible(owner, x, params):
         return None
     mtp = (x.shape[1] != 1 or params.get('recurrent_history') or
            'export_state_norm_keys' in params or getattr(owner, 'caps', {}).get('mtp_draft'))
@@ -87,7 +115,7 @@ def get_native_block(block, x, params):
         (m.shared_experts is not None and not m.bc_sh_exp) or
         m.intermediate_size == 0 or m.num_local_experts != m.num_experts):
         return None
-    rows = x.shape[1]
+    rows = x.shape[0] * x.shape[1]
     native = (getattr(block, '_native_qwen', None) if rows == 1 else
               getattr(block, '_native_qwen_mtp', {}).get(rows))
     if native is None:

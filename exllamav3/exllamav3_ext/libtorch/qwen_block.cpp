@@ -33,14 +33,16 @@ BC_QwenBlock::BC_QwenBlock(std::vector<at::Tensor> w,
 
 at::Tensor BC_QwenBlock::begin(const at::Tensor& x)
 {
-    TORCH_CHECK(x.dim() == 4 && x.size(0) == 1 && x.size(1) == rows &&
+    TORCH_CHECK(x.dim() == 4 && x.size(0) * x.size(1) == rows &&
                 x.size(2) == attn_post.size(1) && x.size(3) == attn_mixed.size(1) &&
                 x.scalar_type() == at::kFloat && x.is_contiguous() &&
                 x.device() == weights[0].device(), "Qwen block: invalid residual stack");
     c10::cuda::CUDAGuard guard(x.device());
     gr_mix(x.view({rows, x.size(2), x.size(3)}), weights[0], weights[1], weights[2],
            attn_eps, attn_dots, attn_post, attn_mixed);
-    return attn_mixed.view({1, rows, x.size(3)});
+    // Residual/router rows are independent, but attention must retain (B, Q)
+    // so paged attention and recurrence select each sequence's own cache/slot.
+    return attn_mixed.view({x.size(0), x.size(1), x.size(3)});
 }
 
 void BC_QwenBlock::finish(at::Tensor x, const at::Tensor& attention_output)
