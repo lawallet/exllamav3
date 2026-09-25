@@ -27,6 +27,7 @@ class Input:
 class TestGuard(unittest.TestCase):
     def setUp(self):
         self.owner = Owner()
+        self.owner.caps = {}
         self.owner.modules = [SimpleNamespace(device='cpu', caps={'prefer_cpu': True}),
                               SimpleNamespace(device='cuda:0', caps={})]
         a, h = n.GatedResidual.__new__(n.GatedResidual), n.GatedResidual.__new__(n.GatedResidual)
@@ -58,7 +59,8 @@ class TestGuard(unittest.TestCase):
             setattr(m.routing_cfg, key, None)
 
     def get(self, params=None, x=None):
-        with patch.object(n, 'ext', SimpleNamespace(BC_QwenBlock=lambda *args: self.sentinel)), \
+        with patch.object(n, 'ext', SimpleNamespace(BC_QwenBlock=lambda *args: self.sentinel,
+                          native_qwen_mtp_max_q_len=getattr(self, 'max_rows', 0))), \
              patch.object(n, '_gate_t'):
             return n.get_native_block(self.block, x or Input(), params or {})
 
@@ -89,6 +91,68 @@ class TestGuard(unittest.TestCase):
     def test_old_extension(self):
         with patch.object(n, 'ext', SimpleNamespace()):
             self.assertIsNone(n.get_native_block(self.block, Input(), {}))
+
+
+class TestMTPGuard(TestGuard):
+    def setUp(self):
+        super().setUp()
+        self.max_rows = 5
+        self.owner.config = SimpleNamespace(arch_string='Qwen4ExpForConditionalGeneration')
+        self.owner.modules += [SimpleNamespace(device='cuda:0', caps={}, key='trunk.final_mixer'),
+                               SimpleNamespace(device='cuda:0', caps={})]
+        self.owner.logit_layer_idx = 3
+        self.draft = Owner()
+        self.draft.caps = {'mtp_draft': True}
+        self.draft.modules = [SimpleNamespace(device='cuda:0', caps={})]
+        self.draft.config = SimpleNamespace(mtp_num_hidden_layers=1)
+        self.draft.attached_model = weakref.ref(self.owner)
+        self.owner._native_qwen_mtp_draft = weakref.ref(self.draft)
+        self.cache = SimpleNamespace(max_history=4)
+        self.state = SimpleNamespace(cache=self.cache, exported=False)
+        self.params = dict(export_state_norm_keys={'trunk.final_mixer'}, recurrent_history=True,
+                           recurrent_states=[self.state], cache=self.cache)
+        self.verify = Input()
+        self.verify.shape = (1, 5, 4, 2560)
+
+    def test_verification_and_bootstrap(self):
+        self.assertIs(self.get(self.params, self.verify), self.sentinel)
+        self.assertIs(self.get(self.params, self.verify), self.sentinel)
+        self.assertIs(self.get(self.params | {'recurrent_history': False}), self.sentinel)
+
+    def test_history_and_export_contract(self):
+        for changed in ({'recurrent_history': False}, {'recurrent_states': []},
+                        {'cache': SimpleNamespace(max_history=4)},
+                        {'export_state_norm_keys': {'another.module'}},
+                        {'export_state_layers': [0]}, {'prefill': True}):
+            self.assertIsNone(self.get(self.params | changed, self.verify))
+        self.cache.max_history = 3
+        self.assertIsNone(self.get(self.params, self.verify))
+        self.cache.max_history = 4
+        self.state.exported = True
+        self.assertIsNone(self.get(self.params, self.verify))
+
+    def test_other_windows_and_cross_gpu(self):
+        for q in (2, 3, 4, 6, 8):
+            x = Input()
+            x.shape = (1, q, 4, 2560)
+            self.assertIsNone(self.get(self.params, x))
+        self.draft.modules[0].device = 'cuda:1'
+        self.assertIsNone(self.get(self.params, self.verify))
+
+    def test_attached_head(self):
+        self.block._native_qwen_owner = weakref.ref(self.draft)
+        params = {'target_hidden': SimpleNamespace(shape=(1, 1, 10240))}
+        self.assertIs(self.get(params), self.sentinel)
+        self.assertIsNone(self.get(params | {'recurrent_history': True}))
+        self.assertIsNone(self.get(params | {'prefill': True}))
+        self.assertIsNone(self.get({'target_hidden': SimpleNamespace(shape=(1, 1, 2560))}))
+        self.owner.modules[1].device = 'cuda:1'
+        self.assertIsNone(self.get(params))
+
+    def test_old_native_extension_mtp_falls_back(self):
+        self.max_rows = 0
+        self.assertIsNone(self.get(self.params, self.verify))
+        self.assertIs(self.get(), self.sentinel)  # Existing non-MTP native path survives.
 
 
 if __name__ == '__main__':

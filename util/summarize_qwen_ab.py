@@ -40,6 +40,15 @@ def main():
             telemetry_samples=len(matching),
             mean_gpu_util_percent=statistics.mean(s[1] for s in matching) if matching else None,
             mean_gpu_power_watts=statistics.mean(s[2] for s in matching) if matching else None)
+        if 'proposed_draft_tokens' in group[0]:
+            metrics = summary['native' if enabled else 'stock']
+            for field in ('proposed_draft_tokens', 'accepted_draft_tokens', 'rejected_draft_tokens', 'acceptance_rate'):
+                metrics[field] = [r[field] for r in group]
+            metrics['native_calls'] = [r['calls']['native'] for r in group]
+            metrics['fallback_calls'] = [r['calls']['fallback'] for r in group]
+            if 'effective_output_tokens_per_second' in group[0]:
+                metrics['mean_effective_output_tokens_per_second'] = statistics.mean(
+                    r['effective_output_tokens_per_second'] for r in group)
     if 'stock' in summary and 'native' in summary:
         summary['improvement_percent'] = 100 * (summary['native']['mean_tokens_per_second'] /
                                                 summary['stock']['mean_tokens_per_second'] - 1)
