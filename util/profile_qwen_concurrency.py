@@ -20,6 +20,7 @@ def main():
     p.add_argument('--extension-dir',type=Path)
     p.add_argument('--installed',action='store_true')
     p.add_argument('--suite',choices=['ordinary','mtp','all'],default='all')
+    p.add_argument('--case',action='append',help='Run only named cases (for targeted follow-up validation)')
     p.add_argument('--regressions',action='store_true')
     p.add_argument('--benchmark',action='store_true')
     p.add_argument('--skip-parity',action='store_true')
@@ -50,6 +51,7 @@ def main():
               torch=torch.__version__,cuda=torch.version.cuda,
               revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),
               arguments={k:str(v) if isinstance(v,Path) else v for k,v in vars(a).items()},
+              environment={k:v for k,v in os.environ.items() if k.startswith(('EXL3_','CUDA_'))},
               mapping='2,0,1',cache_tokens=5120,cache_slots=4,max_history=4,
               sampler='greedy except explicit stochastic parity',seeds=[1234,1235,1236,1237,1238])
     (a.output/'metadata.json').write_text(json.dumps(meta,indent=2),encoding='utf-8')
@@ -61,15 +63,19 @@ def main():
         cases.extend([
             ('ordinary-stagger',dict(mtp=False,count=4,lengths=[24,40,56,88,32],stagger=True)),
             ('ordinary-stochastic',dict(mtp=False,count=2,lengths=[32,48],stochastic=True)),
-            ('ordinary-page-crossing',dict(mtp=False,count=2,lengths=[32,272])),
+            ('ordinary-page-crossing',dict(mtp=False,count=2,lengths=[256,272])),
         ])
     if a.suite in ('mtp','all'):
         cases.extend([
             ('mtp-2',dict(mtp=True,count=2,lengths=[32,64])),
             ('mtp-3',dict(mtp=True,count=3,lengths=[24,40,64])),
             ('mtp-stagger-forced',dict(mtp=True,count=3,lengths=[24,40,72,32],stagger=True,force=True)),
-            ('mtp-page-crossing',dict(mtp=True,count=2,lengths=[24,256])),
+            ('mtp-page-crossing',dict(mtp=True,count=2,lengths=[256,280])),
         ])
+    if a.case:
+        if set(a.case)-{name for name,_ in cases}:
+            p.error('Unknown case or case outside selected suite')
+        cases=[(name,kw) for name,kw in cases if name in a.case]
     for name,kw in cases:
         if not a.skip_parity:
             check_jobs(*common,a.output/name,**kw)
@@ -85,13 +91,20 @@ def main():
         check_mtp(model,draft,cache,dc,tokenizer,prompt,make_gen,a.output/'natural-regression',tokens=128)
         check_mtp(model,draft,cache,dc,tokenizer,prompt,make_gen,a.output/'forced-regression',tokens=64,force_rejections=True)
     if a.benchmark:
+        required=('ordinary-2','ordinary-3','ordinary-4','ordinary-stagger','ordinary-stochastic',
+                  'ordinary-page-crossing','mtp-2','mtp-3','mtp-stagger-forced','mtp-page-crossing')
+        for name in required:
+            proof=a.output/name/'parity.json'
+            if not proof.exists() or not json.loads(proof.read_text())['exact']:
+                raise ValueError(f'Benchmark requires exact parity: {name}')
         runs=[]
         for mtp,n,stagger in [(False,n,False) for n in (1,2,3,4)]+[(True,n,False) for n in (2,3)]+[(False,4,True),(True,3,True)]:
-            # Warm both paths at the actual batch size before measuring.
-            for native in (False,True):
-                run_jobs(*common,native=native,mtp=mtp,count=n,lengths=[16]*n)
             lengths=[384,512,640,768][:n]
             if stagger:lengths.append(256)
+            # Warm the actual cohort, including shape changes/page boundaries,
+            # so a longer-context specialization is not first compiled in a timed run.
+            for native in (False,True):
+                run_jobs(*common,native=native,mtp=mtp,count=n,lengths=lengths,stagger=stagger)
             outputs=[]
             for repeat in range(a.runs):
                 for native in ((False,True) if repeat%2==0 else (True,False)):

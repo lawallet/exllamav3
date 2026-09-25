@@ -25,6 +25,8 @@ def run_jobs(model, draft, cache, dc, tokenizer, *, native, mtp, count, lengths,
     from exllamav3 import Generator, Job, GreedySampler, DefaultSampler
     from exllamav3.modules import TransformerBlock, transformer, native_qwen
     from exllamav3.modules.gated_delta_net import GDNState
+    if correctness:
+        print(f'START parity native={native} mtp={mtp} jobs={count} stagger={stagger}',flush=True)
     transformer._native_qwen_enabled = native
     if correctness:
         clear_kv(cache)
@@ -65,7 +67,9 @@ def run_jobs(model, draft, cache, dc, tokenizer, *, native, mtp, count, lengths,
         return value
 
     def snapshot(kind, full=True):
-        record(kind, jobs={j.identifier:state(j,full) for j in gen.active_jobs if j.recurrent_state is not None})
+        values={j.identifier:state(j,full) for j in gen.active_jobs if j.recurrent_state is not None}
+        record(kind, jobs=values)
+        return values
 
     def ownership():
         live = [j for j in gen.active_jobs if j.recurrent_state is not None]
@@ -173,12 +177,11 @@ def run_jobs(model, draft, cache, dc, tokenizer, *, native, mtp, count, lengths,
                     owner=next((j for j in jobs if j.recurrent_state is rs),None)
                     if owner is None:return rewind(rs,n)
                     others=[j for j in gen.active_jobs if j is not owner and j.recurrent_state is not None]
-                    before={j.identifier:state(j) for j in others}
-                    snapshot('before_rewind')
+                    before=snapshot('before_rewind')
                     rewind(rs,n)
                     rewinds[owner.identifier].append(n)
-                    snapshot('after_rewind')
-                    assert before=={j.identifier:state(j) for j in others}, 'Rewind contaminated another job'
+                    after=snapshot('after_rewind')
+                    assert all(before[j.identifier]==after[j.identifier] for j in others), 'Rewind contaminated another job'
                 scope.enter_context(patch.object(GDNState,'rewind',rewind_state))
         if correctness:
             for j in jobs:
@@ -226,7 +229,7 @@ def run_jobs(model, draft, cache, dc, tokenizer, *, native, mtp, count, lengths,
                     join_after=cycle+3  # Observe the smaller batch before growing it again.
                 if not joined and join_after is not None and cycle>=join_after:
                     gen.enqueue(jobs[count]);enqueued[jobs[count].identifier]=time.perf_counter();joined=True
-                if correctness and cycle%16==0:
+                if correctness and cycle%(8 if mtp else 16)==0:
                     print(f'parity native={native} mtp={mtp} jobs={count} stagger={stagger}: cycle {cycle}',flush=True)
         finally:
             gen.clear_queue()
