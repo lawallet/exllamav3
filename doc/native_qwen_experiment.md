@@ -1,8 +1,7 @@
 # Qwen3.8 native orchestration experiment
 
-The sections below retain the original non-MTP experiment. The final
-"Native MTP extension" section describes the current installed build and its
-additional speculative-decoding validation.
+The sections below retain the original non-MTP and MTP experiments. The final
+"Dynamic batching / concurrency extension" section describes the current build.
 
 ## Recorded environment (2026-09-24)
 
@@ -432,3 +431,367 @@ To restore the protected non-MTP build without changing dependencies:
 
 `util/rollback_exllamav3.ps1` remains available for restoring the original
 official wheel instead.
+
+## Dynamic batching / concurrency extension (2026-09-24)
+
+Development continues on `native-qwen-concurrency` from MTP checkpoint
+`34e7a06` / tag `validated-native-qwen-mtp1-2026-09-24`. That installed wheel
+and the earlier non-MTP checkpoint remain preserved in their separate release
+directories. The concurrency prompt is `concurrency_prompt.md`.
+
+### Actual generator execution and isolation
+
+The source trace and live pre-change trace (`util/trace_qwen_concurrency.py`,
+`native-results/concurrency-trace.json`) show that ready jobs are compacted
+along the **batch** dimension. Transformer residual stacks are `[B,Q,4,2560]`:
+ordinary decode has Q=1; fixed-four MTP verification has Q=5; each of the four
+draft forwards has Q=1. Prefill is performed job by job before the decode
+iteration. Arrivals/completions change B; they do not concatenate independent
+jobs along the sequence dimension. All target rows in one verification call
+share Q. Acceptance length and subsequent cache-repair query lengths can differ
+between jobs; those repairs are separate per-job calls.
+
+`Generator.iterate_gen` builds a separate block-table row and cache length for
+each compacted sequence, and a corresponding list of recurrent state objects.
+GDN tensors are indexed by each state's allocated slot, not its transient batch
+row. PLE convolution and CPU token-ID history use the same slot ownership.
+Each job's page table maps its logical positions to physical target KV/QSA
+pages; the draft uses the same page layout in separate backing tensors.
+The live trace saw slots 0/1/2/3 and distinct initial pages, later reusing freed
+recurrent slots and assigning a separate page after a staggered arrival.
+QSA raw keys, pooled summaries and KV
+follow these page mappings.
+
+MTP drafts all ready jobs together and verifies them together. Each job samples
+and accepts/rejects independently, rewinds its own GDN/PLE slot and page
+positions, repairs its own draft-cache prefix and retains its own
+`mtp_last_hidden`. Live rows in a single call had different accept/reject
+counts and therefore different positions in subsequent calls. Scheduling,
+sampling, recurrent advancement, rewind and cache repair remain unchanged.
+
+### Native boundary and scratch ownership
+
+The old Python guard rejected B != 1 before constructing a context. The MTP
+guard also required one recurrent state and a batch-one target-hidden shape.
+C++ `begin` required `[1,rows,H,D]` and returned `[1,rows,D]`. Widening the Python
+guard alone would still fail that check; flattening jobs into its old sequence
+dimension would corrupt attention/recurrence state selection.
+
+The extension permits ordinary B=2/3/4, Q=1 only with a matching paged table,
+cache-length vector and distinct cache-bound recurrent slots. It gates the new
+ABI with `native_qwen_max_batch=4`, so older extensions safely fall back. C++
+keeps `[B,Q,D]` on the attention boundary and flattens B*Q only for row-local
+residual/routing/MoE operations. Contexts use the existing per-row-count cache:
+each block owns separate residual gates, mixed inputs and router outputs for
+each supported row count. The row-one and row-five contexts remain unchanged.
+
+This is batching inside one serialized generator, not concurrent model.forward
+calls on different Python threads/CUDA streams. Native scratch is consumed
+before the next call on the same stream. Stock MoE output and other existing
+device workspaces also depend on that ordering. Each row's residual is updated
+independently; mutable recurrent/cache state remains in its original slot/page
+storage. No scheduler or math kernels were changed.
+
+**Multi-job MTP target verification deliberately falls back.** Two/three jobs
+produce 10/15 flattened rows, beyond both `GatedResidual.FUSED_MAX_R=8` and
+`BC_BlockSparseMLP.MAX_BSZN=8`. Stock changes to tiled residual mixing and another
+MoE execution path there. This extension does not split those rows or substitute
+the small-row kernels. MTP draft steps with B=2/3, Q=1 are eligible for native
+execution; once only one target job remains, its existing Q=5 native path resumes.
+B=4 MTP draft steps, larger ordinary batches, other query lengths, TP, offload,
+prefill and existing unsupported options retain the stock path.
+
+### Concurrency validation procedure
+
+`util/check_qwen_concurrency.py` uses independent coding, cooking, science,
+fiction and database prompts, seeds 1234 onward, and different output lengths.
+It compares stock/native logits and residuals by row, final IDs/completion
+hashes, per-job RNG state, recurrent/PLE state and history, KV/QSA contents,
+logical page positions and committed MTP carries. Physical page/slot identities
+may differ between runs, so it asserts disjoint ownership and correct block
+tables before comparing logically ordered state. Independent prompts in this
+test do not share prefix pages.
+
+State snapshots cover batch transitions, fixed checkpoints and final release;
+MTP additionally snapshots every rewind and commit. Forward and prefill calls for a subset
+of jobs, including accepted draft-cache repair, and every MTP rewind assert that other jobs' complete state/cache bytes
+remain unchanged. A forced MTP case mutates proposals only for alternating job
+IDs, causing different speculative histories in simultaneous jobs. Actual
+proposal counting slices only active rows: the generator returns a full-capacity
+draft backing view with stale unused rows after the batch shrinks.
+
+Ordinary cases include B=2/3/4, a 4->3->2->3 staggered arrival, seeded stochastic
+sampling, and jobs crossing cache-page boundaries. MTP cases include two/three
+jobs, staggered arrival with forced rejection, and page-boundary crossing.
+The original single-job non-MTP, natural MTP and
+forced-rejection regression suites remain separate checks.
+
+### Serving configuration and measurement scope
+
+The existing TabbyAPI config already sets `model.max_batch_size: 4` and currently
+has `draft_model.draft_mode: disabled`. No service configuration or scheduling
+policy was changed. With the new wheel and `EXL3_NATIVE_QWEN_BLOCK=1` set before
+startup, eligible ordinary decode batches use the extended path automatically.
+MTP remains a separate application setting.
+
+The test cache has 5120 FP16 tokens and four recurrent slots, with history
+capacity four so the same loaded model can run ordinary and MTP suites. This
+differs from the service's configured 65536-token context. Prompts are short;
+the experiment does not establish long-prompt prefill latency or end-to-end
+HTTP/OpenCode latency. Measurements use the actual ExLlama generator loop.
+Per-job first-token latency is time from enqueue to first delivered token,
+completion latency includes queue/prefill time, and delivery gaps expose stalls
+around a new arrival. Aggregate throughput includes prefill and the complete
+cohort lifetime; output lengths differ so the batch shrinks during a run.
+The report additionally separates throughput by actual batch/query shape,
+preventing a faster single-job tail from hiding multi-job MTP fallback cost.
+
+### Build and installed validation provenance
+
+Core concurrency change: `ada76f6`. The wheel is
+`exllamav3-1.5.1+nativeqwen.concurrent1-cp313-cp313-win_amd64.whl`,
+132,509,380 bytes, SHA-256
+`0be06997f5ad556aa9e4d69f44e93132dfb9eaef44546991f403e33425875c74`.
+It uses the same SM89/SM120 build workflow with four compiler workers. No kernels, dependencies,
+CUDA/Torch versions or service configuration were changed. All 31 guard/profile
+unit tests passed. Installed Python files and the extension were compared
+byte-for-byte with the wheel; wheel Python was also compared with the checkout.
+The dependency freeze differs only in the ExLlama wheel reference.
+
+The staged build passed all ten concurrency cases and the existing non-MTP
+128-step, natural-MTP 128-token and forced-MTP 64-token exact regressions.
+Those proofs are retained in `native-results/concurrency-staged`. Since the
+installed build has identical code/extension bytes, the unchanged proofs are
+carried into `concurrency-installed` with `validation-provenance.json` recording
+their origin. Strengthened staggered/page-boundary cases run again against the
+installed package; they add explicit prefill/repair isolation checks, three
+decode cycles at the reduced batch before arrival, and overlapping 256/272
+ordinary and 256/280 MTP output lengths at page boundaries.
+The installed runner started before the harness commit `34629fd`, so its
+metadata records parent `931eb3f`; the working tree already contained the
+prefill, page-reuse and phase-timing changes committed as `34629fd`.
+
+### Final validation results
+
+All cases below passed exact stock/native comparison. Event counts count
+the recorded comparisons, not generated tokens. The four strengthened cases
+ran against the installed wheel; the remaining cases use the identical staged
+wheel as described above.
+
+| Case | Compared events | Native / fallback block calls |
+|---|---:|---:|
+| ordinary-2 | 2138 | 1920 / 96 |
+| ordinary-3 | 3003 | 2688 / 144 |
+| ordinary-4 | 3868 | 3456 / 192 |
+| ordinary-stagger | 4738 | 4224 / 240 |
+| ordinary-stochastic | 2546 | 2304 / 96 |
+| ordinary-page-crossing | 13972 | 13056 / 96 |
+| mtp-2 | 1838 | 768 / 604 |
+| mtp-3 | 1586 | 268 / 901 |
+| mtp-stagger-forced | 2689 | 464 / 1439 |
+| mtp-page-crossing | 6575 | 1352 / 3346 |
+| ordinary-page-reuse (1024-token cache) | 4738 | 4224 / 240 |
+
+The constrained four-page cache reassigned 1 physical page(s)
+to a new job after previous owners completed, with exact state parity.
+The installed ordinary stagger case observed 4 -> 3 -> 2 -> 3 -> 2 -> 1.
+Original single-job regressions also passed: ordinary 128 steps; natural MTP
+128 tokens (91 accepted / 57 rejected drafts); forced MTP 64 tokens
+(34 accepted / 86 rejected).
+
+### Alternating installed benchmarks
+
+Three stock/native pairs per cohort, ordered A/B, B/A, A/B, after full-cohort
+warmup of both paths. All 48 measured runs had identical per-job token IDs,
+completion hashes, RNG state and MTP acceptance counts within their cohort.
+Output lengths were 384/512/640/768 tokens; staggered arrivals added 256.
+The same model, physical GPU 2, mapping 2,0,1, 300 W limit, prompts, greedy
+sampler, seeds, FP16 cache and fixed-four MTP settings were used throughout.
+
+| Cohort | Stock output t/s | Native output t/s | Change | GPU utilization stock/native | GPU watts stock/native | Native / fallback calls per native run |
+|---|---:|---:|---:|---:|---:|---:|
+| ordinary-1 | 53.96 | 70.95 | +31.49% | 59.5% / 73.8% | 166.2 / 186.5 | 18432 / 48 |
+| ordinary-2 | 84.07 | 104.98 | +24.88% | 62.8% / 75.7% | 186.8 / 208.4 | 24576 / 96 |
+| ordinary-3 | 110.77 | 131.79 | +18.98% | 66.9% / 77.8% | 208.2 / 227.3 | 30720 / 144 |
+| ordinary-4 | 138.87 | 155.20 | +11.75% | 72.7% / 78.8% | 225.4 / 236.5 | 36864 / 192 |
+| ordinary-4-stagger | 146.13 | 154.40 | +5.66% | 72.2% / 75.3% | 223.6 / 226.6 | 37008 / 240 |
+| mtp-2 | 97.52 | 97.83 | +0.32% | 53.6% / 52.3% | 184.4 / 183.8 | 3248 / 4970 |
+| mtp-3 | 93.34 | 98.18 | +5.19% | 45.1% / 47.3% | 168.5 / 171.8 | 2800 / 7917 |
+| mtp-3-stagger | 97.74 | 97.83 | +0.10% | 45.8% / 45.5% | 172.2 / 171.9 | 776 / 9953 |
+
+GPU figures are one-second telemetry means restricted to measured run intervals.
+Every sampled power limit was 300 W. Stock runs have zero native calls.
+Fallback counts include prefill and MTP cache-repair calls. Raw per-shape
+call counts, individual run rates and sample counts are in `benchmark.json`
+and `summary.json`.
+
+#### Per-job responsiveness
+
+Each cell below is stock / native, averaged over three runs. Job IDs are
+zero-based; the last job in a staggered cohort arrives later. Effective
+per-job t/s includes its own enqueue-to-completion time.
+
+| Cohort / job | Output t/s | First token ms | Completion s | Maximum delivery gap ms | Gap across arrival ms |
+|---|---:|---:|---:|---:|---:|
+| ordinary-1 / 0 | 53.96 / 70.95 | 102.68 / 96.13 | 7.12 / 5.41 | 27.25 / 18.22 | 0.00 / 0.00 |
+| ordinary-2 / 0 | 45.97 / 56.84 | 185.81 / 180.66 | 8.35 / 6.76 | 27.66 / 19.14 | 0.00 / 0.00 |
+| ordinary-2 / 1 | 48.04 / 59.99 | 185.81 / 180.66 | 10.66 / 8.53 | 27.66 / 19.14 | 0.00 / 0.00 |
+| ordinary-3 / 0 | 43.75 / 50.14 | 304.62 / 297.44 | 8.78 / 7.66 | 28.29 / 20.78 | 0.00 / 0.00 |
+| ordinary-3 / 1 | 44.40 / 51.87 | 304.62 / 297.44 | 11.53 / 9.87 | 28.29 / 21.52 | 0.00 / 0.00 |
+| ordinary-3 / 2 | 46.16 / 54.92 | 304.62 / 297.44 | 13.87 / 11.65 | 28.29 / 21.52 | 0.00 / 0.00 |
+| ordinary-4 / 0 | 43.45 / 45.34 | 376.89 / 371.98 | 8.84 / 8.47 | 28.40 / 22.44 | 0.00 / 0.00 |
+| ordinary-4 / 1 | 44.19 / 46.91 | 376.89 / 371.98 | 11.59 / 10.91 | 28.40 / 22.44 | 0.00 / 0.00 |
+| ordinary-4 / 2 | 44.75 / 48.84 | 376.89 / 371.98 | 14.30 / 13.10 | 28.40 / 22.44 | 0.00 / 0.00 |
+| ordinary-4 / 3 | 46.29 / 51.73 | 376.89 / 371.98 | 16.59 / 14.85 | 28.40 / 22.44 | 0.00 / 0.00 |
+| ordinary-4-stagger / 0 | 42.44 / 41.28 | 377.72 / 379.46 | 9.05 / 9.49 | 29.36 / 91.12 | 0.00 / 0.00 |
+| ordinary-4-stagger / 1 | 43.30 / 43.44 | 377.72 / 379.46 | 11.82 / 11.94 | 29.36 / 91.12 | 0.00 / 0.00 |
+| ordinary-4-stagger / 2 | 43.45 / 44.65 | 377.72 / 379.46 | 14.73 / 14.46 | 108.18 / 143.32 | 108.18 / 101.17 |
+| ordinary-4-stagger / 3 | 43.97 / 46.44 | 377.72 / 379.46 | 17.47 / 16.65 | 108.18 / 143.32 | 108.18 / 101.17 |
+| ordinary-4-stagger / 4 | 45.48 / 54.46 | 108.15 / 101.14 | 5.63 / 4.70 | 32.96 / 20.68 | 0.00 / 0.00 |
+| mtp-2 / 0 | 51.20 / 50.79 | 254.36 / 262.35 | 7.50 / 7.56 | 91.77 / 95.89 | 0.00 / 0.00 |
+| mtp-2 / 1 | 55.73 / 55.91 | 254.36 / 262.35 | 9.19 / 9.16 | 91.77 / 95.89 | 0.00 / 0.00 |
+| mtp-3 / 0 | 38.95 / 39.32 | 379.94 / 340.73 | 9.86 / 9.77 | 105.73 / 103.96 | 0.00 / 0.00 |
+| mtp-3 / 1 | 33.79 / 35.52 | 379.94 / 340.73 | 15.18 / 14.43 | 117.20 / 103.96 | 0.00 / 0.00 |
+| mtp-3 / 2 | 38.89 / 40.91 | 379.94 / 340.73 | 16.49 / 15.65 | 117.20 / 103.96 | 0.00 / 0.00 |
+| mtp-3-stagger / 0 | 39.32 / 39.10 | 381.55 / 377.87 | 9.77 / 9.82 | 108.91 / 108.74 | 0.00 / 0.00 |
+| mtp-3-stagger / 1 | 33.62 / 33.67 | 381.55 / 377.87 | 15.23 / 15.21 | 183.72 / 176.86 | 183.72 / 176.86 |
+| mtp-3-stagger / 2 | 34.91 / 34.94 | 381.55 / 377.87 | 18.33 / 18.32 | 183.72 / 176.86 | 183.72 / 176.86 |
+| mtp-3-stagger / 3 | 30.81 / 31.10 | 183.68 / 176.82 | 8.31 / 8.24 | 102.54 / 119.16 | 0.00 / 0.00 |
+
+#### MTP acceptance and concurrent phases
+
+Acceptance counts are identical in stock and native runs, including the
+different histories of simultaneous jobs. Counts below are per run.
+
+| Cohort / job | Proposed | Accepted | Rejected | Acceptance |
+|---|---:|---:|---:|---:|
+| mtp-2 / 0 | 388 | 287 | 101 | 73.97% |
+| mtp-2 / 1 | 608 | 360 | 248 | 59.21% |
+| mtp-3 / 0 | 388 | 287 | 101 | 73.97% |
+| mtp-3 / 1 | 616 | 358 | 258 | 58.12% |
+| mtp-3 / 2 | 784 | 444 | 340 | 56.63% |
+| mtp-3-stagger / 0 | 388 | 287 | 101 | 73.97% |
+| mtp-3-stagger / 1 | 612 | 359 | 253 | 58.66% |
+| mtp-3-stagger / 2 | 776 | 446 | 330 | 57.47% |
+| mtp-3-stagger / 3 | 376 | 162 | 214 | 43.09% |
+
+Phase throughput divides delivered tokens by total generator-iteration time
+at that target shape across all repeats. It includes draft/repair work and
+prefill on iterations that perform it; it is not kernel-only timing.
+
+| Cohort | Target shape | Stock phase t/s | Native phase t/s |
+|---|---|---:|---:|
+| ordinary-1 | b1/q1 | 53.98 | 70.99 |
+| ordinary-2 | b1/q1 | 55.56 | 72.01 |
+| ordinary-2 | b2/q1 | 91.98 | 113.73 |
+| ordinary-3 | b1/q1 | 54.87 | 71.81 |
+| ordinary-3 | b2/q1 | 92.98 | 115.81 |
+| ordinary-3 | b3/q1 | 131.30 | 150.48 |
+| ordinary-4 | b1/q1 | 55.94 | 73.51 |
+| ordinary-4 | b2/q1 | 94.39 | 117.00 |
+| ordinary-4 | b3/q1 | 139.76 | 157.15 |
+| ordinary-4 | b4/q1 | 173.83 | 181.45 |
+| ordinary-4-stagger | b1/q1 | 55.95 | 73.79 |
+| ordinary-4-stagger | b2/q1 | 93.63 | 117.09 |
+| ordinary-4-stagger | b3/q1 | 135.15 | 154.42 |
+| ordinary-4-stagger | b4/q1 | 169.84 | 161.91 |
+| mtp-2 | b1/q5 | 113.85 | 120.28 |
+| mtp-2 | b2/q5 | 93.88 | 93.12 |
+| mtp-3 | b1/q5 | 105.38 | 111.59 |
+| mtp-3 | b2/q5 | 71.36 | 81.53 |
+| mtp-3 | b3/q5 | 103.37 | 104.37 |
+| mtp-3-stagger | b2/q5 | 79.76 | 79.59 |
+| mtp-3-stagger | b3/q5 | 101.80 | 101.95 |
+
+### Interpretation and limitations
+
+Ordinary cohort throughput improves by 24.9%, 19.0% and 11.8% for initial
+two/three/four-job cohorts. The gain while **all** initial jobs remain active
+is smaller: 23.6%, 14.6% and 4.4%, respectively. The faster smaller-batch tail
+contributes to cohort throughput. Four-job native effective per-job rates are
+45.34/46.91/48.84/51.73 t/s, versus stock 43.45/44.19/44.75/46.29. First-token
+latency is about 372 ms versus 377 ms for these short prompts.
+
+No job starved: all requested outputs completed, shorter ordinary jobs finished
+before longer jobs, and new jobs advanced immediately after their prefill.
+Ordinary staggered arrival interrupted existing jobs for an average 108 ms stock
+versus 101 ms native; the new job's effective rate was 45.48 versus 54.46 t/s.
+This only establishes responsiveness for the tested short prompts, not a
+latency guarantee for arbitrary request queues or long prefill.
+
+There is one retained ordinary-stagger native outlier: aggregate rates were
+162.94, **137.27**, 162.99 t/s versus stock 145.12, 147.14, 146.12. The slow run
+had a 228 ms delivery gap affecting all four initial jobs **before** the new job
+arrived. It raised the shortest job's completion time to 11.48 s versus about
+8.50 s in the other native runs. The new job still completed in 4.69 s and its
+arrival gap was 102 ms. The cause is not established by these measurements;
+it is not justified to attribute it to scheduling, the driver or the native
+code. No result was excluded. Consequently the mean earliest-job latency in
+this staggered cohort regresses despite the aggregate improvement.
+
+Concurrent MTP is correct but offers little consistent native speedup here.
+Two-job cohort gain is 0.3%; its actual B=2,Q=5 phase is 0.8% slower. The
+three-job cohort mean improves 5.2%, but stock runs span 89.71--98.98 t/s and
+native 94.49--100.48, while its B=3,Q=5 phase improves only 1.0%. That cohort
+mean is not evidence of a reliable five-percent concurrent-target optimization.
+Staggered MTP, with no single-job tail, changes only 0.1%. It has average
+arrival gaps of 184 ms stock / 177 ms native and native effective per-job
+rates of 39.10/33.67/34.94/31.10 t/s. Unequal draft acceptance affects delivered
+tokens per iteration even though all ready jobs participate. For these measured
+workloads ordinary native batching outperforms MTP at two/three active jobs.
+The concurrent target continues to use the stock residual/MoE kernel family.
+
+Support remains limited to the tested Qwen3.8/Qwen4Exp single-device serialized
+generator: ordinary B<=4,Q=1; attached one-head MTP draft B<=3,Q=1; existing
+single-job fixed-four MTP verification. Multi-job target verification,
+four-job MTP drafting, other speculative windows/query shapes, TP, offload,
+prefill and the pre-existing exclusions fall back. Simultaneous independent
+model.forward threads/streams are not supported. The existing AsyncGenerator
+serializes generator iterations before dispatching results; this work changes
+neither that behavior nor the service's request scheduling.
+
+### Reproduction, installation and checkpoint
+
+The final checkpoint is tag `validated-native-qwen-concurrent1-2026-09-24` on
+branch `native-qwen-concurrency`. Implementation and harness commits are
+`ada76f6`, `7f8af9b`, `931eb3f` and `34629fd`; the tag also contains this report.
+The release directory is `dist/exllamav3-native-qwen-concurrent1-<tag-commit>/`.
+It contains the exact tested wheel, source ZIP with validation results, a
+standalone Git bundle including the previous checkpoint tags, a portable README,
+build manifest and SHA-256 checksums. The ZIP and wheel receive archive CRC
+verification, and the bundle is verified by Git. The wheel is already installed
+in the existing TabbyAPI venv; dependencies and service configuration are unchanged.
+Old checkpoint/release directories remain untouched.
+
+Full reproduction with the installed wheel (using the exact environment):
+
+```powershell
+$env:CUDA_VISIBLE_DEVICES='2,0,1'
+& D:\tabbyAPI\venv\Scripts\python.exe -u util\profile_qwen_concurrency.py --installed --regressions --benchmark --output native-results\concurrency-repeat
+& D:\tabbyAPI\venv\Scripts\python.exe -u util\profile_qwen_concurrency.py --installed --suite ordinary --case ordinary-page-reuse --cache-tokens 1024 --output native-results\concurrency-reuse-repeat
+```
+
+The profiler selects stock/native internally; production uses
+`EXL3_NATIVE_QWEN_BLOCK=1` set before application startup. MTP remains separately
+configured in the application. Record GPU data in another shell during timing:
+
+```powershell
+nvidia-smi --query-gpu=timestamp,index,uuid,name,utilization.gpu,power.draw,power.limit,memory.used --format=csv -l 1 -f native-results\concurrency-repeat-gpu.csv
+```
+
+`util/summarize_qwen_concurrency.py` combines `benchmark.json` with that CSV.
+Raw proofs are in the release's `results/concurrency-installed` and
+`results/concurrency-reuse`; `validation-provenance.json` identifies staged
+proofs carried over from the identical wheel. The model itself is not packaged.
+
+Install the portable wheel with the compatible environment's Python and
+`-m pip install --no-deps --force-reinstall <wheel-path>`. To restore the
+previous validated MTP build on this machine:
+
+```powershell
+& D:\tabbyAPI\venv\Scripts\python.exe -m pip install --no-deps --force-reinstall D:\exllamav3\dist\exllamav3-native-qwen-mtp1-34e7a06\exllamav3-1.5.1+nativeqwen.mtp1-cp313-cp313-win_amd64.whl
+```
+
+Clearing `EXL3_NATIVE_QWEN_BLOCK` and restarting instead selects stock execution
+in the current wheel. The original official-wheel rollback script remains
+`util/rollback_exllamav3.ps1`.
