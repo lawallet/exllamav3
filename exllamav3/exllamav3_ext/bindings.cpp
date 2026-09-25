@@ -284,9 +284,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/mlp_bc.h"
     #include "libtorch/blocksparse_mlp_bc.h"
     py::class_<BC_QwenBlock>(m, "BC_QwenBlock")
-        .def(py::init<std::vector<at::Tensor>, std::shared_ptr<BC_BlockSparseMLP>, double, double>())
+        .def(py::init<std::vector<at::Tensor>, std::shared_ptr<BC_BlockSparseMLP>, double, double, int64_t>(),
+             py::arg("weights"), py::arg("moe"), py::arg("attn_eps"), py::arg("mlp_eps"), py::arg("rows") = 1)
         .def("begin", &BC_QwenBlock::begin)
         .def("finish", &BC_QwenBlock::finish);
+    m.attr("native_qwen_mtp_max_q_len") = 5;
     #include "libtorch/dsv4_compressor_bc.h"
     #include "libtorch/dsv4_attn_bc.h"
     #include "sam_bc.h"

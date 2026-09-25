@@ -85,6 +85,7 @@ class TransformerBlock(Module):
 
     def load(self, device: torch.device, **kwargs):
         self._native_qwen = None
+        self._native_qwen_mtp = {}
         super().load(device, **kwargs)
         if self.key_layer_scalar:
             self.layer_scalar_t = self.config.stc.get_tensor(
@@ -115,6 +116,7 @@ class TransformerBlock(Module):
 
     def unload(self):
         self._native_qwen = None
+        self._native_qwen_mtp = {}
         super().unload()
         self.layer_scalar_t = None
         self.attn_resid_scalar = None

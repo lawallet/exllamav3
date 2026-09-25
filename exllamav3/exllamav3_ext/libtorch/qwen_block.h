@@ -8,10 +8,12 @@ struct BC_QwenBlock
     std::vector<at::Tensor> weights;
     std::shared_ptr<BC_BlockSparseMLP> moe;
     double attn_eps, mlp_eps;
+    int64_t rows;
     at::Tensor attn_dots, attn_post, attn_mixed;
     at::Tensor mlp_dots, mlp_post, mlp_mixed;
     BC_QwenBlock(std::vector<at::Tensor> weights,
-                 std::shared_ptr<BC_BlockSparseMLP> moe, double attn_eps, double mlp_eps);
+                 std::shared_ptr<BC_BlockSparseMLP> moe, double attn_eps, double mlp_eps,
+                 int64_t rows = 1);
     at::Tensor begin(const at::Tensor& x);
     void finish(at::Tensor x, const at::Tensor& attention_output);
 };

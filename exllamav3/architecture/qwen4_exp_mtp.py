@@ -6,7 +6,7 @@ import weakref
 
 from ..model.config import Config
 from ..model.model import Model
-from ..modules import Embedding, Linear, GatedResidual
+from ..modules import Embedding, Linear, GatedResidual, TransformerBlock
 from ..modules.module import Module
 from ..modules.arch_specific.qwen4_exp_mtp import Qwen4ExpMTPInputLayer
 from ..modules.attn import prepare_for_attn
@@ -138,6 +138,12 @@ class Qwen4ExpMTPModel(Model):
         """
         self.input_layer.attached_model = weakref.ref(target)
         self.attached_model = weakref.ref(target)
+        # Only this attachment authorizes the native MTP protocol. Other draft
+        # architectures and unbound heads retain the stock fallback.
+        target._native_qwen_mtp_draft = weakref.ref(self)
+        for module in self.modules:
+            if isinstance(module, TransformerBlock):
+                module._native_qwen_owner = weakref.ref(self)
 
         target_embed = None
         for m in target.modules:
