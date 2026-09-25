@@ -33,7 +33,12 @@ def summarize(directory,telemetry=None):
                 mean_gpu_power_watts=st.mean(s[2] for s in ts) if ts else None,
                 gpu_samples=len(ts),native_calls=[r['calls']['native'] for r in rows],
                 fallback_calls=[r['calls']['fallback'] for r in rows],
-                shapes=sorted({k for r in rows for k in r['shapes']}),per_job={})
+                shapes=sorted({k for r in rows for k in r['shapes']}),per_job={},phases={})
+            for shape in entry['shapes']:
+                ps=[r['phases'][shape] for r in rows if shape in r['phases']]
+                seconds=sum(v['seconds'] for v in ps)
+                tokens=sum(v['tokens'] for v in ps)
+                entry['phases'][shape]=dict(tokens=tokens,seconds=seconds,effective_tps=tokens/seconds)
             for j in rows[0]['per_job']:
                 js=[r['per_job'][j] for r in rows]
                 entry['per_job'][j]={k:st.mean(v[k] for v in js) for k in

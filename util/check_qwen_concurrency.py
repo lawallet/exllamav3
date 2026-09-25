@@ -21,7 +21,7 @@ PROMPTS = [
 
 @torch.inference_mode()
 def run_jobs(model, draft, cache, dc, tokenizer, *, native, mtp, count, lengths,
-             stagger=False, correctness=False, force=False, stochastic=False):
+             stagger=False, correctness=False, force=False, stochastic=False, require_page_reuse=False):
     from exllamav3 import Generator, Job, GreedySampler, DefaultSampler
     from exllamav3.modules import TransformerBlock, transformer, native_qwen
     from exllamav3.modules.gated_delta_net import GDNState
@@ -46,6 +46,10 @@ def run_jobs(model, draft, cache, dc, tokenizer, *, native, mtp, count, lengths,
     endings, enqueued = {}, {}
     cycle, phase = 0, ''
     prev_active = None
+    page_owners={}
+    page_reassignments=0
+    last_shape=None
+    phases={}
 
     def record(kind, **kw):
         records.append(dict(kind=kind, cycle=cycle, **kw))
@@ -72,6 +76,7 @@ def run_jobs(model, draft, cache, dc, tokenizer, *, native, mtp, count, lengths,
         return values
 
     def ownership():
+        nonlocal page_reassignments
         live = [j for j in gen.active_jobs if j.recurrent_state is not None]
         slots = [j.recurrent_state.slot for j in live]
         assert len(slots) == len(set(slots)), 'Two live jobs share a recurrent slot'
@@ -81,6 +86,11 @@ def run_jobs(model, draft, cache, dc, tokenizer, *, native, mtp, count, lengths,
             pages = [p.page_index for p in s.allocated_pages]
             assert not seen.intersection(pages), 'Independent prompts share mutable pages'
             seen.update(pages)
+            for page in pages:
+                previous=page_owners.get(page)
+                if previous is not None and previous!=j.identifier:
+                    page_reassignments+=1
+                page_owners[page]=j.identifier
             assert s.block_index_tensor[0,:len(pages)].tolist() == pages
             assert j.recurrent_state.cache is cache
         # Allocator slot/page numbers may differ between runs; compare logical
@@ -107,26 +117,28 @@ def run_jobs(model, draft, cache, dc, tokenizer, *, native, mtp, count, lengths,
                     return y
                 scope.enter_context(patch.object(b,'forward',block))
             if correctness:
-                f = mod.forward
-                def forward(input_ids,params=None,_f=f,_r=role):
-                    ids=input_ids
-                    # A prefill/repair call for one job must not mutate the other jobs.
-                    table=params.get('block_table'); seqlens=params.get('cache_seqlens')
-                    touched=set()
-                    if table is not None and seqlens is not None:
-                        from exllamav3.constants import PAGE_SIZE
-                        for row in range(table.shape[0]):
-                            pages=(int(seqlens[row])+ids.shape[1]+PAGE_SIZE-1)//PAGE_SIZE
-                            touched.update(table[row,:pages].tolist())
-                    others = [j for j in gen.active_jobs if j.recurrent_state is not None and
-                              all(p.page_index not in touched for p in j.sequences[0].allocated_pages)]
-                    before = {j.identifier:state(j) for j in others}
-                    y = _f(ids,params)
-                    assert before == {j.identifier:state(j) for j in others}, 'Forward changed another job state'
-                    record('forward',role=_r,ids=ids.tolist(),rows=[digest(t) for t in y],
-                           exports=[[digest(t) for t in e] for e in params.get('export_states',[])])
-                    return y
-                scope.enter_context(patch.object(mod,'forward',forward))
+                for method in ('forward','prefill'):
+                    f = getattr(mod,method)
+                    def forward(input_ids,params=None,_f=f,_r=role,_method=method):
+                        ids=input_ids
+                        # Model.prefill does not call Model.forward. Wrap both so
+                        # new arrivals and accepted draft-cache repair are covered.
+                        table=params.get('block_table'); seqlens=params.get('cache_seqlens')
+                        touched=set()
+                        if table is not None and seqlens is not None:
+                            from exllamav3.constants import PAGE_SIZE
+                            for row in range(table.shape[0]):
+                                pages=(int(seqlens[row])+ids.shape[1]+PAGE_SIZE-1)//PAGE_SIZE
+                                touched.update(table[row,:pages].tolist())
+                        others = [j for j in gen.active_jobs if j.recurrent_state is not None and
+                                  all(p.page_index not in touched for p in j.sequences[0].allocated_pages)]
+                        before = {j.identifier:state(j) for j in others}
+                        y = _f(ids,params)
+                        assert before == {j.identifier:state(j) for j in others}, 'Forward/prefill changed another job state'
+                        record(_method,role=_r,ids=ids.tolist(),rows=[digest(t) for t in y] if y is not None else None,
+                               exports=[[digest(t) for t in e] for e in params.get('export_states',[])])
+                        return y
+                    scope.enter_context(patch.object(mod,method,forward))
         choose = native_qwen.get_native_block
         def native_block(b,x,params):
             result=choose(b,x,params)
@@ -193,10 +205,11 @@ def run_jobs(model, draft, cache, dc, tokenizer, *, native, mtp, count, lengths,
                 scope.enter_context(patch.object(j,'deallocate_pages',deallocate))
         verify=gen.iterate_gen
         def iteration(results,draft_tokens=None):
-            nonlocal prev_active
+            nonlocal prev_active,last_shape
             live=active()
             b,q=len(live),1 if draft_tokens is None else draft_tokens.shape[1]+1
             shapes[f'b{b}/q{q}'] += 1
+            last_shape=f'b{b}/q{q}'
             ids=[j.identifier for j in live]
             changed=ids!=prev_active
             if correctness:
@@ -215,8 +228,15 @@ def run_jobs(model, draft, cache, dc, tokenizer, *, native, mtp, count, lengths,
             joined=not stagger
             join_after=None
             while gen.num_remaining_jobs():
+                tick=time.perf_counter()
+                prior_tokens=sum(j.new_tokens for j in jobs)
                 results=gen.iterate()
                 now=time.perf_counter()
+                if last_shape is not None:
+                    phase_data=phases.setdefault(last_shape,dict(tokens=0,seconds=0,iterations=0))
+                    phase_data['tokens']+=sum(j.new_tokens for j in jobs)-prior_tokens
+                    phase_data['seconds']+=now-tick
+                    phase_data['iterations']+=1
                 for r in results:
                     if r.get('stage')=='error':raise r['error']
                     jid=r.get('identifier')
@@ -225,7 +245,10 @@ def run_jobs(model, draft, cache, dc, tokenizer, *, native, mtp, count, lengths,
                     if jid is not None and r.get('eos'):
                         endings[jid]=dict(result=r,wall=now)
                 cycle+=1
-                if not joined and jobs[1].is_finished and join_after is None:
+                # MTP acceptance can change completion order. Trigger on the
+                # actual shrink, not the identity of an assumed second finisher.
+                finished=sum(j.is_finished for j in jobs[:count])
+                if not joined and finished>=max(1,count-2) and join_after is None:
                     join_after=cycle+3  # Observe the smaller batch before growing it again.
                 if not joined and join_after is not None and cycle>=join_after:
                     gen.enqueue(jobs[count]);enqueued[jobs[count].identifier]=time.perf_counter();joined=True
@@ -239,9 +262,13 @@ def run_jobs(model, draft, cache, dc, tokenizer, *, native, mtp, count, lengths,
     total=sum(v for k,v in counts.items() if k.endswith('/all'))
     used=sum(v for k,v in counts.items() if k.endswith('/native'))
     report=dict(native=native,mtp=mtp,jobs=count,stagger=stagger,force=force,stochastic=stochastic,
+                instrumented_state_checks=correctness,
                 start_epoch=start_epoch,end_epoch=time.time(),seconds=elapsed,
                 aggregate_tps=sum(j.new_tokens for j in jobs)/elapsed,shapes=dict(shapes),
-                calls=dict(counts,total=total,native=used,fallback=total-used),per_job={})
+                calls=dict(counts,total=total,native=used,fallback=total-used),per_job={},
+                page_reassignments=page_reassignments,phases=phases)
+    for v in phases.values():v['effective_tps']=v['tokens']/max(v['seconds'],1e-9)
+    if require_page_reuse:assert page_reassignments>0,'Test never reused a page from a completed job'
     join_time=enqueued.get(str(count)) if stagger else None
     report['join_time_seconds']=join_time-start if join_time is not None else None
     for j in jobs:
@@ -288,6 +315,7 @@ def check_jobs(model,draft,cache,dc,tokenizer,output,**kw):
     role='draft' if kw['mtp'] else 'target'
     assert sb['calls'].get(f'{role}/b{kw["count"]}/q1/native',0)>0,'Concurrent fast path not exercised'
     result=dict(exact=True,events=len(a),shapes=sb['shapes'],calls=sb['calls'],
+                page_reassignments=sb['page_reassignments'],
                 per_job={j:{k:v[k] for k in ('tokens','completion_sha256','proposed','accepted','rejected','rewinds')}
                          for j,v in sb['per_job'].items()})
     (output/'parity.json').write_text(json.dumps(result,indent=2),encoding='utf-8')

@@ -25,6 +25,7 @@ def main():
     p.add_argument('--benchmark',action='store_true')
     p.add_argument('--skip-parity',action='store_true')
     p.add_argument('--runs',type=int,default=3)
+    p.add_argument('--cache-tokens',type=int,default=5120)
     a=p.parse_args()
     if a.installed:
         sys.path=[s for s in sys.path if Path(s or '.').resolve()!=ROOT]
@@ -39,8 +40,8 @@ def main():
     cfg=Config.from_directory(a.model)
     assert cfg.arch_string=='Qwen4ExpForConditionalGeneration' and cfg.mtp_num_hidden_layers==1
     model,draft=Model.from_config(cfg),Model.from_config(cfg,component='mtp')
-    cache=Cache(model,5120,max_batch_size=4,max_history=4)
-    dc=Cache(draft,5120,max_batch_size=4)
+    cache=Cache(model,a.cache_tokens,max_batch_size=4,max_history=4)
+    dc=Cache(draft,a.cache_tokens,max_batch_size=4)
     tokenizer=Tokenizer.from_config(cfg)
     draft.load(device=torch.device('cuda:0'))
     model.load(device=torch.device('cuda:0'))
@@ -52,7 +53,7 @@ def main():
               revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),
               arguments={k:str(v) if isinstance(v,Path) else v for k,v in vars(a).items()},
               environment={k:v for k,v in os.environ.items() if k.startswith(('EXL3_','CUDA_'))},
-              mapping='2,0,1',cache_tokens=5120,cache_slots=4,max_history=4,
+              mapping='2,0,1',cache_tokens=a.cache_tokens,cache_slots=4,max_history=4,
               sampler='greedy except explicit stochastic parity',seeds=[1234,1235,1236,1237,1238])
     (a.output/'metadata.json').write_text(json.dumps(meta,indent=2),encoding='utf-8')
     common=(model,draft,cache,dc,tokenizer)
@@ -65,6 +66,9 @@ def main():
             ('ordinary-stochastic',dict(mtp=False,count=2,lengths=[32,48],stochastic=True)),
             ('ordinary-page-crossing',dict(mtp=False,count=2,lengths=[256,272])),
         ])
+        if a.cache_tokens==1024:
+            cases.append(('ordinary-page-reuse',dict(mtp=False,count=4,lengths=[24,40,56,88,32],
+                          stagger=True,require_page_reuse=True)))
     if a.suite in ('mtp','all'):
         cases.extend([
             ('mtp-2',dict(mtp=True,count=2,lengths=[32,64])),
