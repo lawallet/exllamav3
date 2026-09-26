@@ -86,6 +86,7 @@ class TransformerBlock(Module):
 
     def load(self, device: torch.device, **kwargs):
         self._native_glm_mtp = {}
+        self._native_glm_batch = {}
         self._native_glm = None
         self._native_qwen = None
         self._native_qwen_mtp = {}
@@ -119,6 +120,7 @@ class TransformerBlock(Module):
 
     def unload(self):
         self._native_glm_mtp = {}
+        self._native_glm_batch = {}
         self._native_glm = None
         self._native_qwen = None
         self._native_qwen_mtp = {}

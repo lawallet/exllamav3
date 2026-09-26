@@ -4,11 +4,11 @@
 #include <ATen/Functions.h>
 #include <c10/cuda/CUDAGuard.h>
 
-BC_GlmBlock::BC_GlmBlock(std::vector<at::Tensor> w, double ne, double he, int64_t it, int64_t r)
-    : weights(std::move(w)), norm_eps(ne), hc_eps(he), iterations(it), rows(r)
+BC_GlmBlock::BC_GlmBlock(std::vector<at::Tensor> w, double ne, double he, int64_t it, int64_t r, int64_t b)
+    : weights(std::move(w)), norm_eps(ne), hc_eps(he), iterations(it), rows(r * b), batch(b), q_len(r)
 {
     TORCH_CHECK(weights.size() == 8, "GLM: expected two fn/base/scale/norm bundles");
-    TORCH_CHECK(rows == 1 || rows == 4, "GLM: supported row counts are 1 and 4");
+    TORCH_CHECK((q_len == 1 && batch >= 1 && batch <= 4) || (q_len == 4 && batch >= 1 && batch <= 3), "GLM: unsupported batch/query shape");
     auto device = weights[0].device();
     TORCH_CHECK(device.is_cuda(), "GLM: CUDA weights required");
     c10::cuda::CUDAGuard guard(device);
@@ -26,12 +26,12 @@ BC_GlmBlock::BC_GlmBlock(std::vector<at::Tensor> w, double ne, double he, int64_
     comb = at::empty({rows, 4, 4}, opts);
     collapsed = at::empty({rows, 4096}, opts.dtype(at::kHalf));
     normalized = at::empty_like(collapsed);
-    normalized3 = normalized.view({1, rows, 4096});
+    normalized3 = normalized.view({batch, q_len, 4096});
 }
 
 void BC_GlmBlock::validate(const at::Tensor& x) {
     TORCH_CHECK(x.device() == weights[0].device() && x.scalar_type() == at::kFloat &&
-                x.is_contiguous() && x.sizes() == at::IntArrayRef({1, rows, 4, 4096}), "GLM: invalid residual");
+                x.is_contiguous() && x.sizes() == at::IntArrayRef({batch, q_len, 4, 4096}), "GLM: invalid residual");
 }
 
 at::Tensor BC_GlmBlock::mix_norm(const at::Tensor& x, int site) {
@@ -44,7 +44,7 @@ at::Tensor BC_GlmBlock::mix_norm(const at::Tensor& x, int site) {
 
 void BC_GlmBlock::apply(const at::Tensor& x, const at::Tensor& y) {
     TORCH_CHECK(y.device() == x.device() && y.is_contiguous() &&
-                y.sizes() == at::IntArrayRef({1, rows, 4096}) &&
+                y.sizes() == at::IntArrayRef({batch, q_len, 4096}) &&
                 (y.scalar_type() == at::kFloat || y.scalar_type() == at::kHalf), "GLM: invalid sublayer output");
     hc_apply(x.view({rows, 4, 4096}), y.view({rows, 4096}), post, comb);
 }

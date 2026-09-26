@@ -285,12 +285,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/mlp_bc.h"
     #include "libtorch/blocksparse_mlp_bc.h"
     py::class_<BC_GlmBlock>(m, "BC_GlmBlock")
-        .def(py::init<std::vector<at::Tensor>, double, double, int64_t, int64_t>(),
-             py::arg("weights"), py::arg("norm_eps"), py::arg("hc_eps"), py::arg("iterations"), py::arg("rows") = 1)
+        .def(py::init<std::vector<at::Tensor>, double, double, int64_t, int64_t, int64_t>(),
+             py::arg("weights"), py::arg("norm_eps"), py::arg("hc_eps"), py::arg("iterations"), py::arg("rows") = 1, py::arg("batch") = 1)
         .def("begin", &BC_GlmBlock::begin)
         .def("middle", &BC_GlmBlock::middle)
         .def("finish", &BC_GlmBlock::finish);
     m.attr("native_glm_mtp_max_q_len") = 4;
+    m.attr("native_glm_max_batch") = 4;
+    m.attr("native_glm_mtp_max_batch") = 3;
 
     py::class_<BC_QwenBlock>(m, "BC_QwenBlock")
         .def(py::init<std::vector<at::Tensor>, std::shared_ptr<BC_BlockSparseMLP>, double, double, int64_t>(),

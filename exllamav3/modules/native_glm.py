@@ -1,4 +1,4 @@
-"""Opt-in GLM5Next single-row mHC orchestration, with stock attention/MLP."""
+"""Opt-in GLM5Next ordinary mHC orchestration, with stock attention/MLP."""
 import torch
 from ..ext import exllamav3_ext as ext
 from .hyperconnections import HyperConnection
@@ -13,7 +13,8 @@ def get_native_block(block, x, params):
     owner = ref() if ref else None
     if (owner is None or owner.loaded_tp or not hasattr(ext, 'BC_GlmBlock') or
         owner.config.arch_string != 'Glm5NextForConditionalGeneration' or
-        tuple(x.shape) != (1, 1, 4, 4096) or x.dtype != torch.float32 or
+        (len(x.shape) != 4 or not 1 <= x.shape[0] <= 4 or tuple(x.shape[1:]) != (1, 4, 4096)) or x.dtype != torch.float32 or
+        (x.shape[0] > 1 and getattr(ext, "native_glm_max_batch", 0) != 4) or
         not x.is_cuda or not x.is_contiguous() or torch.device(block.device) != x.device or
         any(k in params for k in ('capture', 'quant_preserve', 'backend', 'export_state_layers',
                                   'export_state_norm_keys', 'target_hidden', 'loras', 'activate_all_experts')) or
@@ -23,7 +24,9 @@ def get_native_block(block, x, params):
     cache = params.get('cache')
     states = params.get('recurrent_states')
     if (cache is None or cache.max_history != 0 or getattr(owner, 'caps', {}).get('mtp_draft') or
-        not states or len(states) != 1 or states[0].cache is not cache or states[0].exported):
+        not states or len(states) != x.shape[0] or
+        any(s.cache is not cache or s.exported for s in states) or
+        (len(states) > 1 and len({s.slot for s in states}) != len(states))):
         return None
     # Only the measured model shape and ordered Pro 6000 -> 4090D split. Do not
     # infer residency from a CUDA ordinal alone (CUDA_VISIBLE_DEVICES remaps it).
@@ -42,7 +45,8 @@ def get_native_block(block, x, params):
     signature += tuple(v for h, n in ((a, an), (m, mn)) for v in
         (h.hc_mult, h.hidden_size, h.sinkhorn_iters, h.hc_eps, h.rms_eps,
          n.rms_norm_eps, n.constant_bias, n.constant_scale, n.groups, n.span_heads, n.unweighted))
-    cached = getattr(block, '_native_glm', None)
+    batch = x.shape[0]
+    cached = getattr(block, '_native_glm', None) if batch == 1 else getattr(block, '_native_glm_batch', {}).get(batch)
     if cached is not None and cached[0] == signature:
         return cached[1]
     if (torch.cuda.device_count() != 2 or 'RTX PRO 6000' not in torch.cuda.get_device_name(0) or
@@ -68,6 +72,10 @@ def get_native_block(block, x, params):
         if h.fn_h is None:
             h.fn_h = h.fn.half()
         weights.extend((h.fn_h, h.base, h.scale, n.weight))
-    native = ext.BC_GlmBlock(weights, 1e-5, 1e-6, 20)
-    block._native_glm = (signature, native)
+    native = ext.BC_GlmBlock(weights, 1e-5, 1e-6, 20) if batch == 1 else ext.BC_GlmBlock(weights, 1e-5, 1e-6, 20, 1, batch)
+    if batch == 1:
+        block._native_glm = (signature, native)
+    else:
+        if not hasattr(block, '_native_glm_batch'): block._native_glm_batch = {}
+        block._native_glm_batch[batch] = (signature, native)
     return native

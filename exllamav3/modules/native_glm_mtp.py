@@ -16,7 +16,8 @@ def get_native_mtp_block(block, x, params):
         owner.config.arch_string != 'Glm5NextForConditionalGeneration' or
         owner.config.num_hidden_layers != 45 or owner.config.num_mtp_layers != 1 or
         getattr(ext, 'native_glm_mtp_max_q_len', 0) != 4 or
-        x.ndim != 4 or x.shape[0] != 1 or x.shape[1] not in (1,4) or tuple(x.shape[2:]) != (4,4096) or
+        x.ndim != 4 or not 1 <= x.shape[0] <= 3 or x.shape[1] not in (1,4) or tuple(x.shape[2:]) != (4,4096) or
+        (x.shape[0] > 1 and getattr(ext, "native_glm_mtp_max_batch", 0) != 3) or
         not x.is_cuda or not x.is_contiguous() or x.dtype != torch.float32 or
         torch.device(block.device) != x.device or x.device.index != (0 if block.layer_idx < 35 else 1) or
         any(k in params for k in ('capture','quant_preserve','backend','export_state_layers','target_hidden','loras','activate_all_experts')) or
@@ -27,8 +28,9 @@ def get_native_mtp_block(block, x, params):
     if bool(params.get('recurrent_history')) != (x.shape[1] == 4):
         return None
     cache, states = params.get('cache'), params.get('recurrent_states')
-    if (cache is None or cache.max_history != 3 or not states or len(states) != 1 or
-        states[0].cache is not cache or states[0].exported):
+    if (cache is None or cache.max_history != 3 or not states or len(states) != x.shape[0] or
+        any(s.cache is not cache or s.exported for s in states) or
+        (len(states)>1 and len({s.slot for s in states})!=len(states))):
         return None
     a,m,an,mn = block.attn_hc,block.mlp_hc,block.attn_norm,block.mlp_norm
     if (type(a) is not HyperConnection or type(m) is not HyperConnection or
@@ -42,7 +44,8 @@ def get_native_mtp_block(block, x, params):
     slots = getattr(block, '_native_glm_mtp', None)
     if slots is None:
         slots = block._native_glm_mtp = {}
-    cached = slots.get(x.shape[1])
+    key = x.shape[1] if x.shape[0] == 1 else tuple(x.shape[:2])
+    cached = slots.get(key)
     if cached is not None and cached[0] == signature:
         return cached[1]
     if (torch.cuda.device_count() != 2 or 'RTX PRO 6000' not in torch.cuda.get_device_name(0) or
@@ -65,6 +68,6 @@ def get_native_mtp_block(block, x, params):
             return None
         if h.fn_h is None: h.fn_h=h.fn.half()
         weights.extend((h.fn_h,h.base,h.scale,n.weight))
-    native=ext.BC_GlmBlock(weights,1e-5,1e-6,20,x.shape[1])
-    slots[x.shape[1]]=(signature,native)
+    native=ext.BC_GlmBlock(weights,1e-5,1e-6,20,x.shape[1]) if x.shape[0] == 1 else ext.BC_GlmBlock(weights,1e-5,1e-6,20,x.shape[1],x.shape[0])
+    slots[key]=(signature,native)
     return native
