@@ -973,3 +973,174 @@ reinstall the preserved `nativeglm.mtp1` wheel from
 fresh worktree at `glm53-native-mtp-v1`. Exact commands are in the release README.
 Both protected GLM releases were rehashed unchanged and protected GLM/Qwen
 revisions were rechecked before packaging; Qwen artifacts were not modified.
+
+
+## 64K deployment closure
+
+This phase starts at protected `glm53-native-concurrency-v1`
+(`c486ed70bd9e1ae4428eb07ed9231aed937d12b4`) on a new
+`native-glm53-longctx` branch. The concurrency release manifest, wheel, source
+archive and production Python hashes were verified before harness changes.
+Earlier results remain untouched. The exact wheel SHA-256 remains
+`283885767a606dcf9a8e22a7c805b0207ca77334b66c81faba1be0eb966bc5bc`;
+no production inference source change or rebuild is used for this phase.
+
+`util/check_glm_longctx.py` reuses the real dynamic-generator concurrency
+harness with one active sequence and the original stock/native switch. It
+constructs a deterministic token stream from numbered measurement records,
+retains the model chat prefix/assistant suffix, and saves the exact token IDs.
+The prompt is 65,216 tokens, leaving space below the 65,536-token deployment
+ceiling for decode and the fixed-three-draft speculative window. Cache capacity
+is 65,536 tokens / 256 pages, with the existing fp16 MLA/indexer/pool format.
+The same physical GPUs 2,0 and 90/44 GiB budgets are used; loading asserts target
+layers 0--34 on logical 0 and 35--44 plus head on logical 1. One recurrent slot
+is provisioned, with history 0 ordinary and 3 MTP. Draft placement is asserted
+on logical 0. No alternative split is accepted if loading changes placement.
+
+Intermediate stock prefill block hashes and growing cache-prefix hashes are
+omitted. The complete final valid prefix is hashed, followed by complete valid
+state throughout decode. Existing residual, routing, hidden/logit, recurrent,
+convolution, logical cache/page, RNG and transfer checks are retained. The
+sparse observer additionally records the ordered selected-token index hash for
+every MLA layer and query row, visible length, selected count and incomplete
+pool-tail count, and asserts causal bounds. Thus equality of stored indexer
+keys alone cannot hide different sparse selections. Helpers reset the established
+arange, recurrent-slot and block-table caches for transfer-count comparisons.
+
+For MTP, optional harness-only deep snapshots add complete state immediately
+before verification and after draft-prefix repair, plus explicit draft hidden
+inputs. Existing before/after-rewind snapshots, the independent history-selection
+oracle, committed state, written speculative prefixes and carried hidden state
+remain in use. The new option defaults off for existing short-context harness
+users. Logical pooled validity is floor(position / 4); invalid suffix/padding is
+excluded. Sparse selection statics are transient and shared between serial
+layers, so they are captured immediately at each attention return.
+
+The first load proved the 64K cache fits at the required placement, then stopped
+before generation on JSON serialization of a NumPy int64 storage-size value.
+The harness now converts it to a Python int. That diagnostic is retained in
+`native-results/glm53-longctx/metadata-diagnostic*`; it was not an inference or
+parity failure.
+
+### 64K ordinary result
+
+Passed 27,133 exact event records and 2,816 sparse-selection records (11 MLA
+layers x 256 decode steps). Prompt 65,216 + 256 outputs = 65,472 sequence tokens;
+the final committed cache/recurrent position is 65,471 because the last emitted
+token has not yet been fed back. Decode crosses position 65,280, growing from
+255 to 256 logical pages. All 34 KDA layers and all 11 complete valid MLA latent,
+indexer and pooled-key planes match, including current recurrent matrices and
+valid convolution windows. Sparse widths are 2,048/2,049/2,050/2,051, with each
+tail size observed 704 times, and their ordered selection hashes match exactly.
+
+All 11,520 q1 target block calls are native. The 1,485 prefill block calls remain
+stock (1,395 q2048, 45 q1536, 45 q191). The real generator's default prefill
+chunk is 2048; model loading used its existing 256-token measuring chunk.
+Reported B0 iterations are generator bookkeeping while prefill is incomplete,
+not model forwards. Every transfer group matches by source/destination, shape
+and dtype. A memory sample during the gate was 94,078 MiB on physical GPU 2 and
+32,073 MiB on physical GPU 0; the original split was unchanged.
+
+One post-parity stock/native smoke pair, without state hashing, produced
+42.058 / 50.528 decode tokens/s (+20.14%). These are observational single samples,
+not another performance campaign; both completions equal the parity run. Prompt
+ingestion is excluded from the reported job decode rate. The short-context
+concurrency campaign remains the primary performance evidence.
+
+The first MTP observation attempt was deliberately interrupted during stock
+prefill after confirming that the generator uses target `forward` (to export
+draft hidden states), not target `prefill`, for this phase. The observer initially
+treated those calls as decode. Both entry points now mark prompt ingestion for
+observation purposes; inference calls and inputs are unchanged. The interrupted
+log, metadata, placement and prompt IDs are retained in `mtp-prefill-diagnostic*`.
+This was an observer-coverage correction, not an observed stock/native mismatch.
+
+The optional two-job long-context test is omitted. The validated cache has 256
+pages; two independent 65,216-token prompts alone would require 510 pages.
+MTP already uses about 97,076 MiB on the 97,887 MiB Pro 6000 in a decode-state
+sample, leaving limited headroom. This phase does not expand cache provisioning
+or alter placement to engineer optional concurrency. Short-context concurrency
+remains protected; concurrent independent near-64K sequences are not certified.
+
+### 64K MTP result
+
+Passed 8,775 exact events and 595 sparse-selection events comprising 1,968 query
+rows across target and draft. The same 65,216-token prompt plus 128 generated
+tokens gives 65,344 sequence tokens / final committed position 65,343, crossing
+65,280 and occupying 256 logical pages. All 34 target KDA layers, 11 target
+MLA/indexer/pool layers and the draft MLA/indexer/pool layer match in their
+complete logically valid ranges. Transient written speculative prefixes and
+subsequent valid overwrites also match. Sparse selections include all pool-tail
+sizes, and target/draft hidden inputs, exports, logits and carried state agree.
+
+There are 40 real q4 verification rounds, 120 proposals, 88 accepted drafts and
+32 rejected drafts (73.33% acceptance). Rollback depths 0/1/2/3 occur
+25/5/6/4 times respectively. All 40 before/after-rewind comparisons and independent
+history-selection oracle checks pass. There are 35 accepted-prefix draft repairs
+(q1:6, q2:5, q3:24), each followed by the added full-state snapshot, plus 33
+initial draft-prefill calls. The 72 before-verification/commit events include 32
+prefill-only generator iterations; all 40 actual verification rounds receive
+those snapshots. Natural rejection already covers every depth, so no additional
+forced long-context run is necessary.
+
+All 1,800 q4 target block calls are native. Fallback totals 1,673: 1,485 target
+prefill blocks plus 188 draft blocks (31 q2048, one q1536, one q191, 126 q1,
+five q2 and 24 q3). Draft q1 counts include 120 proposal forwards and six repairs.
+All transfer groups match exactly, including both GPU directions and CPU uploads;
+the native path introduces no extra transfers. Target/draft cache capacity and
+placement remain unchanged throughout rejection and repair.
+
+One uninstrumented decode smoke pair produced 75.093 / 74.917 tokens/s
+stock/native (-0.24%, effectively tied). Output IDs, completion hashes, RNG and
+proposal/accept/reject counts match the exact runs. This shows no catastrophic
+native regression at the tested context; it is not evidence of a meaningful
+MTP speed difference. Prefill timing is excluded from this decode metric.
+
+Transfer counts are identical in 18 ordinary and 31 MTP shape/dtype groups.
+Aggregated only for orientation, ordinary counts are CPU->logical0:871,
+CPU->logical1:582 and logical0->logical1:289; MTP counts are 787,150,193 and
+logical1->logical0:188 respectively. The raw parity files retain the actual
+shape/dtype grouping, including legitimate target residual and draft/carry
+transfers, rather than relying on these aggregate counts alone.
+
+Reproduce from the repository root using the existing environment and extracted
+unchanged concurrency wheel (each output directory should be fresh):
+
+```powershell
+$env:CUDA_VISIBLE_DEVICES = '2,0'
+$py = 'D:\tabbyAPI\venv\Scripts\python.exe'
+& $py util/check_glm_longctx.py --suite ordinary --prompt-tokens 65216 --tokens 256 --output native-results/glm53-longctx-repro/ordinary --smoke
+& $py util/check_glm_longctx.py --suite mtp --prompt-tokens 65216 --tokens 128 --output native-results/glm53-longctx-repro/mtp --smoke
+```
+
+Both commands default to the verified concurrency `wheel-stage` directory;
+`--package-dir` can select a fresh extraction of that same wheel. Native flags
+are toggled internally for comparison. `--forced` is available only as a
+test-proposal mutation if a different natural prompt lacks rollback coverage.
+
+### Final regression and deployment verdict
+
+Focused exact regressions against the unchanged wheel passed after both long
+gates: ordinary GLM 256 steps / 45 blocks; changing-membership B4/B3/B2/B1
+ordinary, 8,737 events and slot reuse; natural MTP 128 outputs / 5,905 events;
+forced MTP 64 outputs / 4,621 events; and Qwen 128 steps / 48 blocks, including
+its recurrent/PLE, KV/QSA and fallback checks with the GLM flag enabled. No
+historical benchmark campaign was repeated. Smoke output IDs, completion hashes,
+RNG and speculation counts were also checked against their long exact runs.
+
+The final protected checkpoint is `glm53-native-longctx-v1` on
+`native-glm53-longctx`. Its release directory is
+`native-results/glm53-longctx/release`, containing a byte-identical copy of the
+concurrency wheel, source ZIP with the new harness/report, validation ZIP, Git
+bundle, README/rollback instructions and SHA-256 manifest. Production source
+and the prior GLM/Qwen checkpoint/release identities are rechecked during
+packaging. The wheel is reused, not rebuilt under a different filename.
+
+For the specified single-job 64K ceiling, ordinary q1 and fixed-three-draft MTP
+q4 target verification are exact and fully native. KDA and long-context
+MLA/DSA/indexer/pool state remain exact, including sparse selections and
+speculative retreat/repair. No production inference code, dependencies, GPU
+placement, installed package or Tabby configuration changed. Existing strict
+feature/placement guards remain. Near-64K concurrency is outside this closure,
+and the sampled MTP memory headroom is about 811 MiB on the Pro 6000. The
+requested deployment validation is complete; no further optimization is pursued.

@@ -25,7 +25,7 @@ PROMPTS = [
 
 @torch.inference_mode()
 def run_jobs(model, draft, cache, dc, tokenizer, *, native, mtp, count, lengths,
-             stagger=False, correctness=False, force=False, stochastic=False, require_page_reuse=False, cancel=False, diagnostic=False, prefix_tokens=None):
+             stagger=False, correctness=False, force=False, stochastic=False, require_page_reuse=False, cancel=False, diagnostic=False, prefix_tokens=None, deep_state_checks=False):
     from exllamav3 import Generator, Job, GreedySampler, DefaultSampler
     from exllamav3.modules import TransformerBlock, transformer, native_glm
     from exllamav3.modules.gated_delta_net import GDNState
@@ -199,12 +199,16 @@ def run_jobs(model, draft, cache, dc, tokenizer, *, native, mtp, count, lengths,
                                         assert not torch.count_nonzero(c[rs.slot,:,:layer.module.conv_kernel_size]).item()
                                         assert not torch.count_nonzero(r[rs.slot,0]).item()
                                     record('fresh_state_zero',job=j.identifier)
+                        if deep_state_checks and 'target_hidden' in params:
+                            record('draft_hidden_input',hidden=digest(params['target_hidden']))
                         record('before_model',role=_r,method=_method,jobs={j.identifier:state(j,False) for j,_ in bindings},lengths=[n for _,n in bindings],history=bool(params.get('recurrent_history')))
                         y = _f(ids,params)
                         if _r=='draft':
                             for j,n in bindings: draft_valid[j.identifier]=n+ids.shape[1]
                         if mtp or _method=='prefill':
                             record('after_model',role=_r,method=_method,jobs={j.identifier:dict(state=state(j,False),written_kv=kv(dc if _r=='draft' else cache,j,n+ids.shape[1])) for j,n in bindings})
+                        if deep_state_checks and _r=='draft' and _method=='prefill':
+                            snapshot('after_draft_repair')
                         assert before == {j.identifier:state(j) for j in others}, 'Forward/prefill changed another job state'
                         record(_method,role=_r,ids=ids.tolist(),rows=[digest(t) for t in y] if y is not None else None,
                                exports=[[digest(t) for t in e] for e in params.get('export_states',[])])
@@ -321,6 +325,8 @@ def run_jobs(model, draft, cache, dc, tokenizer, *, native, mtp, count, lengths,
             changed=ids!=prev_active
             if correctness:
                 ownership()
+                if deep_state_checks:
+                    snapshot('before_verification')
             begin=time.perf_counter() if diagnostic else 0.0
             verify(results,draft_tokens)
             if diagnostic: host_seconds['generator/verify']+=time.perf_counter()-begin
