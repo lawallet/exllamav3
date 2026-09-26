@@ -259,3 +259,302 @@ manifest identifies the source commit and every release artifact; its own hash
 is not recursively included. The Git bundle contains the GLM branch/tag and its
 history back through the protected Qwen checkpoint. Raw results, traces and
 telemetry remain under `native-results/glm53/` as well.
+
+## MTP phase: trace from the protected non-MTP checkpoint
+
+Starting point: `glm53-native-nonmtp-v1` (`1630fd3`), new branch
+`native-glm53-mtp`; outputs under `native-results/glm53-mtp/`. Python, Torch,
+CUDA, Triton and FLA versions and 300/425 W power limits were rechecked unchanged.
+The model now has configured `mtp_bits=4`; its text architecture configuration
+matches the saved non-MTP configuration. No model/dependency conversion is done.
+
+GLM's single MTP layer has `default_draft_size=3` (also the Tabby fallback).
+This is the selected fixed window, not a claim of a hard engine limit: the
+generator accepts an override. Dynamic confidence truncation is disabled here.
+Observed stock shapes: target verification (1,4), draft forward (1,1), and
+accepted-prefix repair prefill (1,1), (1,2), (1,3). Initial target forward and
+draft prefill use the 31-token prompt prefix. A bootstrap with no carried hidden
+state can use target (1,1). Target verification sets recurrent_history=True.
+
+Stock Tabby loading order was reproduced: draft autosplit first, target 90/44 GiB
+second. Actual target placement remains layers 0–34 on logical 0 (Pro 6000),
+layers 35–44 and head on logical 1 (4090D). All MTP modules reside on logical 0.
+attach_to binds the CPU embedding and shared target head and requests export of
+the POST-final-RMSNorm target hidden state (after mean stream collapse).
+The draft input separately normalizes that hidden state and the token embedding,
+concatenates embedding then hidden (8192 channels), and projects to 4096.
+The draft block is plain residual MLA/MoE, followed by its own final norm.
+
+MTP adds stock hidden-state traffic: target carry/repair inputs travel from the
+4090D to the Pro 6000; draft outputs travel back to the shared head on the 4090D.
+Between draft steps, the returned hidden state again moves to the Pro 6000.
+Draft embeddings upload from CPU. The native trunk boundary must add none of
+these copies or move any module/cache. Trunk verification carries a four-row
+residual through the same layer-35 boundary.
+
+KDA cache history has four recurrent matrices per slot (current plus three
+history entries), and convolution width 4+3. Verification advances four tokens;
+GDNState records last_history=3. Rejection calls rewind(n), which dispatches the
+existing per-device batched recurrent/convolution rewind kernels, subtracts n
+from position and clears last_history. Full acceptance calls rewind(0) to
+normalize convolution state. MLA latent/indexer/pool tensors are not erased on
+rejection: page/sequence lengths retreat, invalid suffixes are ignored and later
+overwritten. Complete pooled keys are valid only through floor(valid_length/4).
+
+After acceptance, Generator.iterate_gen repairs draft cache positions K+1 through
+K+A-1 using accepted IDs and exported target hidden states via draft.prefill.
+It clones the target hidden at A-1 into job.mtp_last_hidden for the next round.
+Persistent state consists of that carry, target recurrent/convolution state,
+target/draft MLA planes and shared logical page positions; the draft has no KDA.
+
+Existing GLM guards reject export_state_norm_keys, recurrent_history, nonzero
+cache.max_history and any shape other than (1,1,4,4096). Native scratch and
+views are hard-coded to one row. Simply dropping those guards would be unsafe.
+The extension needs independently sized four-row scratch using the same stock
+hc_mix/RMSNorm/hc_apply kernels and operation order, plus an attachment-aware
+guard for the actual three-draft protocol. The plain residual draft stays stock.
+
+Stock trace: 29 target q4 forwards, 87 draft q1 forwards, repair q1/q2/q3 counts
+11/3/6 in the 64-token diagnostic. Instrumented target host time per forward:
+mHC 10.08 ms, outer RMSNorm 3.47 ms, MoE 6.58 ms. Draft host methods total about
+0.96 ms per forward, with input preparation/transfers and norms prominent;
+MLA/MoE already dispatch existing native kernels. Optimizing 45 trunk mHC sites
+is the evidence-based priority; no new specialized draft kernel is justified in
+this phase. The first stock 1000-token MTP run measured 64.70 effective output
+t/s, with 646 accepted and 416 rejected drafts. First-use compilation affected
+the preceding 128-token warmup, so final benchmarks warm the full measured span.
+
+### MTP implementation and validation contract
+
+BC_GlmBlock now accepts a row count of 1 (the original constructor default) or 4.
+Its allocations/views use that count; the three boundary calls, math kernels,
+weights, normalization arguments and operation order are unchanged. Ordinary
+decode retains its original eligibility logic and scratch cache. MTP dispatch
+uses a separate `native_glm_mtp.py` guard and per-query-length scratch cache.
+GLM attach_to records a weak reference solely for validating the trunk/draft
+relationship. Loading/unloading clears the added scratch cache.
+
+MTP eligibility requires the attached GLM text model, the precise final-norm
+export key, a single local recurrent slot, history capacity 3, the validated
+35/10 target placement and Pro-6000-resident draft. q4 requires history; q1
+bootstrap requires no history. Other windows, batched rows, TP, exports from
+individual blocks, conversion/capture, LoRA and incompatible attachment/layouts
+fall back. The MTP component itself always stays stock. Missing extension MTP
+support also falls back. The ordinary and MTP scratch objects are independent.
+
+The MTP parity harness runs the real generator twice, stock then native, recording
+target/draft head logits, token proposals, all block residuals, routing IDs and
+weights, exported target state, draft hidden inputs/outputs, carried state,
+logical page positions and device-boundary tensor hashes. Persistent snapshots
+cover before/after rewind, before/after draft-cache repair and committed state.
+Recurrent history is restricted to valid slots, and KV/indexer planes to the
+valid logical prefix; complete pool entries stop at floor(length/4). Backing KV
+storage is cleared between runs, but unused padding is not treated as model state.
+
+An independent rewind oracle hashes the selected history matrix and convolution
+window before rewind, then checks the restored current state and position. Test-
+only forced mutation records genuine proposals first, then changes one rotating
+proposal column. Natural tests require accepted and rejected drafts and full
+acceptance; forced tests require all rejection depths 1,2,3. Any mismatch or
+missing coverage aborts before throughput. Instrumentation is removed for timed
+runs; stock job.draft_stats supplies acceptance distributions without extra
+per-layer benchmark hooks. Native/fallback counts are also measured separately.
+
+Natural 128-output-token validation passed: 5905 exact events, 78 accepted /
+72 rejected drafts. Rewind depths 0/1/2/3 occurred 16/7/17/10 times in each mode;
+all 50 restoration checks passed. All 2250 target q4 block calls used native
+orchestration, and no draft call did.
+
+
+### MTP measured results
+
+The staged 128-token forced-proposal run passed 8695 byte-exact events. Both
+modes accepted 54 and rejected 168 drafts (24.3243% acceptance), with rewind
+0/1/2/3 counts 1/13/28/32 and 74 independent restoration checks. All 3330 target
+q4 block calls were native; the draft remained stock. Original proposals and
+mutated proposals are separately retained in the event logs.
+
+After those two parity gates, each mode warmed the entire 1000-token span.
+The measured order was A/B, B/A, A/B. No per-layer hooks or tensor hashing ran
+during these measurements. Effective rate is new output tokens / engine generation
+time (prefill excluded); synchronized total wall time and engine prefill time
+are also retained. The older ordinary rate convention excludes the first output
+token from its numerator, so MTP summary.json records that rate separately too.
+
+| Run | Mode | Effective output t/s | Generation seconds | Total seconds | Prefill/first-token marker ms |
+|---|---|---:|---:|---:|---:|
+| 1 | Stock | 64.4950 | 15.5051 | 15.6720 | 164.56 |
+| 2 | Native | 64.8275 | 15.4255 | 15.5901 | 162.33 |
+| 3 | Native | 64.5595 | 15.4896 | 15.6549 | 162.75 |
+| 4 | Stock | 64.4758 | 15.5097 | 15.6749 | 162.87 |
+| 5 | Stock | 64.0417 | 15.6148 | 15.7837 | 166.57 |
+| 6 | Native | 64.8796 | 15.4132 | 15.5795 | 164.01 |
+
+Means: **64.3375 stock / 64.7556 native (+0.65%)**; medians 64.4758/64.8275.
+This is effectively tied at the resolution of this experiment, not evidence of
+another large speedup. Every run proposed 1062 drafts, accepted 646 and rejected
+416 (60.8286% acceptance). Each had 354 verification windows: accepted counts
+0/1/2/3 occurred 60/79/78/137 times, equivalently rollback depths 0/1/2/3 occurred
+137/78/79/60 times. Each native run therefore executed 15930 native target block
+calls. Its 1062 draft forward blocks, 294 repair blocks and initial target/draft
+prefill stayed stock; native MTP-component calls were zero. A separate 64-token
+instrumented pass confirmed 1305/1305 target q4 blocks native, with identical
+stock/native call shapes. Completion SHA-256 for all six runs:
+`29ed8c773f2719b4cc466684108b578fb5d27ed96c15e941400d76647287aa2f`.
+
+| Run | Pro 6000 mean util % / W | 4090D mean util % / W |
+|---|---:|---:|
+| 1 stock | 50.27 / 172.96 | 38.20 / 78.41 |
+| 2 native | 48.21 / 176.22 | 39.36 / 78.52 |
+| 3 native | 48.07 / 177.95 | 37.79 / 78.26 |
+| 4 stock | 45.71 / 180.19 | 37.00 / 78.25 |
+| 5 stock | 48.50 / 182.20 | 36.79 / 77.96 |
+| 6 native | 45.93 / 185.12 | 37.73 / 78.87 |
+
+VRAM was 96572 MiB on physical GPU 2 and 30377 MiB on physical GPU 0 throughout
+all six runs. Power caps remained 300 W and 425 W. Raw 1 Hz nvidia-smi samples,
+per-run maxima and sample counts are retained; WDDM utilization does not establish
+whether execution is GPU-bound. Physical GPU 1 was not used for inference.
+
+The separate instrumented target-forward host time fell from 745.21/29 = 25.70 ms
+to 494.82/29 = 17.06 ms; instrumentation itself disproportionately taxes Python
+calls, so this is not a throughput prediction. Draft input and block host time
+were nearly unchanged. The evidence supports amortization of ordinary host
+boundary overhead under four-row verification, with remaining draft, transfer,
+attention and generator work limiting further benefit. It does not isolate those
+remaining costs well enough to justify a new draft kernel. The ordinary-path
+percentage advantage does **not** stack multiplicatively with MTP in this setup.
+
+All sessions are retained. The initial stock trace measured 64.7008 t/s; its
+first-use 128-token warmup was 14.9268 t/s including compilation. Full-span warmups
+and all six subsequent rates are in `ab-staged/`; no measured outlier was dropped.
+
+
+### Reproducing the MTP validation
+
+Use the existing Tabby Python environment and CUDA toolkit; build with
+`util/build_native_glm_mtp.bat` (SM 8.9 + 12.0, no dependency installation or
+build isolation). Extract the resulting wheel into a fresh directory before
+using `--package-dir`. The benchmark harness refuses an existing output directory.
+For example, in PowerShell from `D:\exllamav3`:
+
+```powershell
+$env:CUDA_VISIBLE_DEVICES = '2,0'
+& D:\tabbyAPI\venv\Scripts\python.exe util/profile_glm_mtp.py `
+  --model D:\tabbyAPI\models\GLM-5.3-Flash-Uncensored-EXL3-3.05bpw `
+  --package-dir native-results/glm53-mtp/wheel-stage `
+  --output native-results/glm53-mtp/reproduction `
+  --parity-tokens 256 --forced-tokens 128 --tokens 1000 --runs 3
+& D:\tabbyAPI\venv\Scripts\python.exe util/summarize_glm_mtp.py `
+  native-results/glm53-mtp/reproduction
+```
+
+`--parity-only` stops after both exact gates; `--trace-only` is deliberately a
+stock-only diagnostic and does not claim a validated native benchmark. The
+harness alternates the internal feature flag explicitly, regardless of its
+initial environment value. Normal use selects GLM with `EXL3_NATIVE_GLM_BLOCK=1`;
+`EXL3_NATIVE_QWEN_BLOCK` remains independent. Both flags are read at import time.
+Use a fixed three-draft window, a single active sequence and target cache history
+capacity 3. Other speculative row lengths safely use the existing stock path.
+The validated placement is narrowly guarded, including draft placement on logical
+GPU 0. Concurrency, TP, other splits, long contexts and alternate draft windows
+are not validated by this release. q1 MTP bootstrap is guard-tested; the real
+32-token-prompt MTP runs exercise q4 verification, while ordinary regression
+exercises the original one-row native math.
+
+
+### Transfer-counter diagnostic
+
+The first packaged 256-token pass matched all 11481 tensor/state events but
+failed the newly added all-transfer-count gate. A separate 32-token diagnostic
+isolated exactly two stock-only CPU-to-GPU uploads of a 248-element int64 index
+vector (one per GPU). GPU-to-GPU counts were identical. These are the process-wide
+`buffered_aranges` cache: stock ran first and populated it, native reused it.
+The harness now clears that index cache before each parity run, preserving the
+full transfer equality assertion. No inference code or wheel changed. The failed
+pass (`wheel-parity/`) and diagnostic (`transfer-diagnostic/`, including both
+count dictionaries) are retained with the corrected run (`wheel-validated/`).
+The failed gate launched no benchmark. Guard tests also passed: 8 original GLM,
+8 MTP-specific and 29 Qwen cases (45 distinct tests).
+
+
+The benchmark was run from the development checkout before the final validation
+commit, so its environment.json revision identifies the protected starting
+commit. `wheel-source-hashes.json` verifies every packaged Python source against
+the tested checkout; the staged and packaged extension binaries also match
+SHA-256 `d2229c5c63966dc39e451370842e46c713459ba2d1b154f62188ee367a0555b8`.
+The final release manifest identifies the committed source and exact tested wheel.
+Protected Qwen revision `39b6a5e994b728bc35aae89963f5739a1f500a48`, non-MTP tag
+`1630fd380b83b05488fc56c594fdd25bcd0adcd5` and all five non-MTP release files were
+reverified unchanged (`protected-checkpoints.json`). The installed Tabby package
+has not been replaced by this experiment.
+
+
+### Packaged wheel and regressions
+
+The exact packaged wheel passed the corrected natural 256-token MTP test:
+11481 exact events, 158 accepted / 136 rejected drafts (53.7415% acceptance),
+98 restoration checks, and rewind 0/1/2/3 counts 29/24/25/20. The sequence crosses
+a 256-token page boundary (two allocated pages). All 4410 target q4 block calls
+were native and no draft block was native. Every transfer count matched stock,
+including CPU uploads and GPU-to-GPU copies grouped by direction, shape and dtype.
+In particular, the layer-35 q4 transfer occurred 98 times, shared-head draft
+output transfers 294 times, and hidden carry/repair traffic matched exactly.
+Raw events, statistics and placement are in `wheel-validated/natural/`.
+
+
+Packaged forced rejection also passed: 64 output tokens, 4621 exact events,
+25 accepted / 92 rejected drafts (21.3675%), 39 restoration checks, rewind
+0/1/2/3 counts 1/5/14/19, and 1755/1755 target verification blocks native.
+All transfer counts matched; the larger staged forced run above adds 128-token
+coverage. Logs are in `wheel-validated/forced/`.
+
+The packaged shared extension passed the existing **256-step ordinary GLM
+byte-exact regression**, including logits, tokens, every block, routing, final
+hidden, transfer boundary and valid persistent cache/recurrent/indexer state.
+Fresh ordinary 1000-token A/B, B/A, A/B rates were:
+
+| Pair | Stock t/s | Native t/s |
+|---|---:|---:|
+| 1 | 38.4842 | 46.8389 |
+| 2 | 38.5160 | 47.3255 |
+| 3 | 38.6382 | 47.0927 |
+| Mean | **38.5461** | **47.0857** |
+
+The ordinary gain is **22.15%**, consistent with the original staged experiment;
+it was preserved. All six ordinary completions hash to
+`f469da222ccd55f5fb45670c8e798d823f65a8aa0ccfc0b3bf045c4af04e0bde`.
+Raw prefill/generation/total times, telemetry and profiles are retained under
+`ordinary-regression/`. MTP and ordinary completions differ, so direct speed
+ratios between the two protocols are workload-dependent; the stock/native
+comparison *within* each protocol is exact and uses identical completions.
+
+
+The packaged Qwen regression passed 128 steps across all 48 native blocks with
+`EXL3_NATIVE_GLM_BLOCK` enabled: exact logits/tokens, block residuals, recurrent
+and PLE state, KV/QSA state, and fallback checks. This used the existing
+`Qwen3.8-Flash-Next-Uncensored-exl3-4bpw` model; no Qwen implementation changed.
+Result: `qwen-wheel.json`.
+
+### MTP checkpoint, artifacts and rollback
+
+Validated branch `native-glm53-mtp`, tag **`glm53-native-mtp-v1`**. Release directory:
+`native-results/glm53-mtp/release/`. It contains the exact tested
+`exllamav3-1.5.1+nativeglm.mtp1-cp313-cp313-win_amd64.whl`, source ZIP, complete
+validation ZIP, Git bundle, README and SHA256SUMS.txt (including source commit).
+Wheel SHA-256:
+`986c088532d1eeb81e5889dc7478789c92b5f628a4740d6ed5cb304467ab630c`.
+The bundle preserves history back through both protected checkpoints. Validation
+includes raw natural/forced state-event logs, all measured sessions, telemetry,
+profiles, failed transfer diagnostic, guard logs, build log and wheel identities.
+
+No package installation was performed. To opt in later, stop the inference process,
+then install the preserved wheel using the existing Tabby venv pip with
+`--no-deps --force-reinstall`; enable `EXL3_NATIVE_GLM_BLOCK=1` before restarting.
+For immediate stock GLM behavior, set that flag to `0` and restart. For full
+non-MTP package rollback, reinstall the preserved `nativeglm.decode1` wheel from
+`native-results/glm53/release/`, disable MTP, and use tag
+`glm53-native-nonmtp-v1` in a separate checkout if source rollback is needed.
+The Qwen package remains preserved at
+`native-results/wheels/exllamav3-1.5.1+nativeqwen.concurrent1-cp313-cp313-win_amd64.whl`.
+Release README gives the exact commands without overwriting existing checkpoints.

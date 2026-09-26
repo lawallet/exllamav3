@@ -1,0 +1,2 @@
+[gMASK]<sop><|user|>
+Explain how a computer executes a program, from source code to processor instructions. Include concrete examples and explain each stage in detail.<|assistant|>

@@ -6,6 +6,9 @@ from .rmsnorm import RMSNorm
 
 
 def get_native_block(block, x, params):
+    if 'export_state_norm_keys' in params:
+        from .native_glm_mtp import get_native_mtp_block
+        return get_native_mtp_block(block, x, params)
     ref = getattr(block, '_native_glm_owner', None)
     owner = ref() if ref else None
     if (owner is None or owner.loaded_tp or not hasattr(ext, 'BC_GlmBlock') or

@@ -189,6 +189,7 @@ class Glm5NextMTPModel(Model):
         """
         self.input_layer.attached_model = weakref.ref(target)
         self.attached_model = weakref.ref(target)
+        target._native_glm_mtp_draft = weakref.ref(self)
 
         # Find the target's embedding (first module of class Embedding)
         target_embed = None
