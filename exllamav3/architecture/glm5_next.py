@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing_extensions import override
 import math
+import weakref
 import os, json
 import numpy as np
 import torch
@@ -353,6 +354,9 @@ class Glm5NextModel(Model):
             "linear_attn": True,
         })
         self.recurrent_state_cls = GDNState
+        for module in self.modules:
+            if isinstance(module, TransformerBlock):
+                module._native_glm_owner = weakref.ref(self)
 
 
     @override

@@ -1,1 +1,1 @@
-__version__ = "1.5.1+nativeqwen.concurrent1"
+__version__ = "1.5.1+nativeglm.decode1"

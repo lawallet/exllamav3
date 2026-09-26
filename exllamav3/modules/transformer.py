@@ -9,6 +9,7 @@ from ..util import profile_opt
 import os
 
 _native_qwen_enabled = os.environ.get('EXL3_NATIVE_QWEN_BLOCK', '0') == '1'
+_native_glm_enabled = os.environ.get('EXL3_NATIVE_GLM_BLOCK', '0') == '1'
 
 class TransformerBlock(Module):
 
@@ -84,6 +85,7 @@ class TransformerBlock(Module):
         return [a, m]
 
     def load(self, device: torch.device, **kwargs):
+        self._native_glm = None
         self._native_qwen = None
         self._native_qwen_mtp = {}
         super().load(device, **kwargs)
@@ -115,6 +117,7 @@ class TransformerBlock(Module):
             )
 
     def unload(self):
+        self._native_glm = None
         self._native_qwen = None
         self._native_qwen_mtp = {}
         super().unload()
@@ -155,6 +158,15 @@ class TransformerBlock(Module):
             if native is not None:
                 y = native.begin(x)
                 y = self.attn.forward(y, params)
+                native.finish(x, y)
+                return to2(x, out_dtype, self.out_dtype)
+
+        if _native_glm_enabled:
+            from .native_glm import get_native_block
+            native = get_native_block(self, x, params)
+            if native is not None:
+                y = self.attn.forward(native.begin(x), params)
+                y = self.mlp.forward(native.middle(x, y), params)
                 native.finish(x, y)
                 return to2(x, out_dtype, self.out_dtype)
 

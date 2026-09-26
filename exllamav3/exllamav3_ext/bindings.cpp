@@ -55,6 +55,7 @@
 #include "parallel/all_reduce.cuh"
 
 #include "libtorch/gated_delta_net.h"
+#include "libtorch/glm_block.h"
 #include "libtorch/attention.h"
 #include "libtorch/mla_attention.h"
 #include "libtorch/linear.h"
@@ -283,6 +284,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/gated_rmsnorm_bc.h"
     #include "libtorch/mlp_bc.h"
     #include "libtorch/blocksparse_mlp_bc.h"
+    py::class_<BC_GlmBlock>(m, "BC_GlmBlock")
+        .def(py::init<std::vector<at::Tensor>, double, double, int64_t>())
+        .def("begin", &BC_GlmBlock::begin)
+        .def("middle", &BC_GlmBlock::middle)
+        .def("finish", &BC_GlmBlock::finish);
+
     py::class_<BC_QwenBlock>(m, "BC_QwenBlock")
         .def(py::init<std::vector<at::Tensor>, std::shared_ptr<BC_BlockSparseMLP>, double, double, int64_t>(),
              py::arg("weights"), py::arg("moe"), py::arg("attn_eps"), py::arg("mlp_eps"), py::arg("rows") = 1)
