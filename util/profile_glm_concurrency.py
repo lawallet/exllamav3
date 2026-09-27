@@ -24,10 +24,13 @@ def main():
     p.add_argument('--case',action='append',help='Run only named cases (for targeted follow-up validation)')
     p.add_argument('--regressions',action='store_true')
     p.add_argument('--benchmark',action='store_true')
+    p.add_argument('--compare-plan',action='store_true')
     p.add_argument('--skip-parity',action='store_true')
     p.add_argument('--runs',type=int,default=3)
     p.add_argument('--cache-tokens',type=int,default=5120)
     a=p.parse_args()
+    if a.compare_plan and (a.skip_parity or a.case or a.trace_only or os.environ.get('EXL3_NATIVE_PLAN') != '1'):
+        p.error('--compare-plan requires full parity and EXL3_NATIVE_PLAN=1')
     if a.runs<3: p.error("At least three alternating pairs are required")
     if a.trace_only and a.benchmark: p.error("Trace-only cannot authorize a benchmark")
     if a.package_dir: sys.path.insert(0,str(a.package_dir.resolve()))
@@ -109,6 +112,9 @@ def main():
         prompt=(ROOT/'doc/native_glm53_prompt.txt').read_text(encoding='utf-8')
         result=check(model,cache,tokenizer,prompt,steps=256)
         (a.output/'non-mtp-regression.json').write_text(json.dumps(result,indent=2))
+    if a.compare_plan:
+        from util.native_plan_validation import benchmark_jobs
+        benchmark_jobs(common, run_jobs, a.suite, a.output, a.runs, diagnostic=True)
     if a.benchmark:
         required=(['ordinary-2','ordinary-3','ordinary-4','ordinary-stagger','ordinary-stochastic','ordinary-page-crossing','ordinary-cancel'] if not draft else ['mtp-2','mtp-3','mtp-stagger-forced','mtp-page-crossing','mtp-cancel'])
         for name in required:

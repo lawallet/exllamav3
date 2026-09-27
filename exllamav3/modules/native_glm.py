@@ -3,6 +3,7 @@ import torch
 from ..ext import exllamav3_ext as ext
 from .hyperconnections import HyperConnection
 from .rmsnorm import RMSNorm
+from . import native_plan
 
 
 def get_native_block(block, x, params):
@@ -11,7 +12,7 @@ def get_native_block(block, x, params):
         return get_native_mtp_block(block, x, params)
     ref = getattr(block, '_native_glm_owner', None)
     owner = ref() if ref else None
-    if (owner is None or owner.loaded_tp or not hasattr(ext, 'BC_GlmBlock') or
+    if (owner is None or owner.loaded_tp or (native_plan.enabled and not native_plan.available) or not hasattr(ext, 'BC_GlmBlock') or
         owner.config.arch_string != 'Glm5NextForConditionalGeneration' or
         (len(x.shape) != 4 or not 1 <= x.shape[0] <= 4 or tuple(x.shape[1:]) != (1, 4, 4096)) or x.dtype != torch.float32 or
         (x.shape[0] > 1 and getattr(ext, "native_glm_max_batch", 0) != 4) or
@@ -31,7 +32,7 @@ def get_native_block(block, x, params):
     # Only the measured model shape and ordered Pro 6000 -> 4090D split. Do not
     # infer residency from a CUDA ordinal alone (CUDA_VISIBLE_DEVICES remaps it).
     expected_device = 0 if block.layer_idx < 35 else 1
-    if x.device.index != expected_device:
+    if not native_plan.enabled and x.device.index != expected_device:
         return None
     a, m, an, mn = block.attn_hc, block.mlp_hc, block.attn_norm, block.mlp_norm
     if (type(a) is not HyperConnection or type(m) is not HyperConnection or
@@ -45,15 +46,19 @@ def get_native_block(block, x, params):
     signature += tuple(v for h, n in ((a, an), (m, mn)) for v in
         (h.hc_mult, h.hidden_size, h.sinkhorn_iters, h.hc_eps, h.rms_eps,
          n.rms_norm_eps, n.constant_bias, n.constant_scale, n.groups, n.span_heads, n.unweighted))
+    signature += (x.device, tuple(x.shape[:2]), x.dtype, native_plan.enabled)
     batch = x.shape[0]
     cached = getattr(block, '_native_glm', None) if batch == 1 else getattr(block, '_native_glm_batch', {}).get(batch)
     if cached is not None and cached[0] == signature:
         return cached[1]
-    if (torch.cuda.device_count() != 2 or 'RTX PRO 6000' not in torch.cuda.get_device_name(0) or
+    if native_plan.enabled:
+        if not native_plan.glm_placement(owner):
+            return None
+    elif ('RTX PRO 6000' not in torch.cuda.get_device_name(0) or
         '4090 D' not in torch.cuda.get_device_name(1) or owner.config.num_hidden_layers != 45):
         return None
     for b in owner.modules:
-        if getattr(b, '_native_glm_owner', None) is not None:
+        if not native_plan.enabled and getattr(b, '_native_glm_owner', None) is not None:
             if torch.device(b.device).index != (0 if b.layer_idx < 35 else 1):
                 return None
     weights = []
@@ -72,7 +77,7 @@ def get_native_block(block, x, params):
         if h.fn_h is None:
             h.fn_h = h.fn.half()
         weights.extend((h.fn_h, h.base, h.scale, n.weight))
-    native = ext.BC_GlmBlock(weights, 1e-5, 1e-6, 20) if batch == 1 else ext.BC_GlmBlock(weights, 1e-5, 1e-6, 20, 1, batch)
+    native = native_plan.glm(weights, batch, 1)
     if batch == 1:
         block._native_glm = (signature, native)
     else:

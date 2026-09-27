@@ -19,6 +19,7 @@ def main():
     p.add_argument('--suite',choices=['ordinary','mtp'],required=True)
     p.add_argument('--output',type=Path,required=True)
     p.add_argument('--package-dir',type=Path,default=ROOT/'native-results/glm53-concurrency/wheel-stage')
+    p.add_argument('--extension-dir',type=Path,help='Use checkout Python with an isolated development extension')
     p.add_argument('--prompt-tokens',type=int,default=65216)
     p.add_argument('--tokens',type=int,default=256)
     p.add_argument('--forced',action='store_true')
@@ -26,7 +27,10 @@ def main():
     a=p.parse_args(); a.output.mkdir(parents=True,exist_ok=True)
     assert os.environ.get('CUDA_VISIBLE_DEVICES')=='2,0'
     assert a.prompt_tokens+a.tokens+4<=65536
-    sys.path.insert(0,str(a.package_dir.resolve()))
+    if a.extension_dir:
+        sys.path.insert(1,str(a.extension_dir.resolve()))
+    else:
+        sys.path.insert(0,str(a.package_dir.resolve()))
     import torch,exllamav3,exllamav3_ext
     from exllamav3 import Config,Model,Cache,Tokenizer
     from exllamav3.modules import TransformerBlock,MLAttention
@@ -75,7 +79,7 @@ def main():
     def encode(text,*args,**kwargs):
         return ids.clone() if text==protected else original_encode(text,*args,**kwargs)
     common=(model,draft,cache,dc,tokenizer)
-    def run(native,correctness):
+    def run(native,correctness,label=None):
         sparse=[]; prefill_active=[False]; progress=[0]
         original_kv=h.kv
         # Prefill is stock in both modes. Hash its complete final prefix, then every
@@ -121,7 +125,7 @@ def main():
                             return y
                         scope.enter_context(patch.object(attention,'forward',attention_forward))
             events,report=h.run_jobs(*common,native=native,mtp=mtp,count=1,lengths=[a.tokens],correctness=correctness,force=a.forced,diagnostic=not correctness,deep_state_checks=mtp)
-        name='native' if native else 'stock'
+        name=label or ('native' if native else 'stock')
         (a.output/(name+'-events.json')).write_text(json.dumps(events))
         (a.output/(name+'-sparse.json')).write_text(json.dumps(sparse))
         (a.output/(name+'-summary.json')).write_text(json.dumps(report,indent=2))
@@ -129,6 +133,12 @@ def main():
     with torch.inference_mode():
         stock,ss,sr=run(False,True)
         native,ns,nr=run(True,True)
+        from exllamav3.modules import native_plan
+        if native_plan.enabled:
+            from util.native_plan_validation import backend
+            with backend([m for m in (model, draft) if m is not None], False):
+                bespoke,bs,br=run(True,True,'bespoke')
+            assert native==bespoke and ns==bs, 'Long-context bespoke/plan mismatch'
         assert len(stock)==len(native),(len(stock),len(native))
         for i,(x,y) in enumerate(zip(stock,native)):
             if x!=y:

@@ -46,11 +46,14 @@ def main():
     p.add_argument('--package-dir', type=Path)
     p.add_argument('--trace-only', action='store_true')
     p.add_argument('--parity-only', action='store_true')
+    p.add_argument('--compare-plan', action='store_true')
     p.add_argument('--tokens', type=int, default=1000)
     p.add_argument('--parity-tokens', type=int, default=128)
     p.add_argument('--forced-tokens', type=int, default=128)
     p.add_argument('--runs', type=int, default=3)
     a = p.parse_args()
+    if a.compare_plan and (a.parity_only or a.trace_only or os.environ.get('EXL3_NATIVE_PLAN') != '1'):
+        p.error('--compare-plan requires EXL3_NATIVE_PLAN=1 and validated benchmarking')
     if a.extension_dir and a.package_dir: p.error('Choose either --extension-dir or --package-dir')
     if a.tokens < 1000 or a.runs < 3:
         p.error('Measured benchmarks require >=1000 tokens and >=3 pairs')
@@ -171,6 +174,9 @@ def main():
             save(f'profile-{int(enabled)}.json',dict(shapes=dict(shapes),counts=counts.report(),target=target_profile.report(),draft=draft_profile.report()))
         if len({r['completion_sha256'] for r in results}) != 1:
             raise AssertionError('Benchmark completions differ')
+        if a.compare_plan:
+            from util.native_plan_validation import benchmark
+            benchmark([model, draft], lambda n: run(True, n), a.tokens, a.runs, a.output, None, 64)
     finally:
         stopped.set(); worker.join()
 

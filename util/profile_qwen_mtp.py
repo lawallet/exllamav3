@@ -25,7 +25,10 @@ def main():
     parser.add_argument('--runs', type=int, default=3)
     parser.add_argument('--parity-tokens', type=int, default=128)
     parser.add_argument('--parity-only', action='store_true')
+    parser.add_argument('--compare-plan', action='store_true')
     args = parser.parse_args()
+    if args.compare_plan and (args.parity_only or os.environ.get('EXL3_NATIVE_PLAN') != '1'):
+        parser.error('--compare-plan requires EXL3_NATIVE_PLAN=1 and benchmarking')
     if args.installed and args.extension_dir:
         parser.error('--installed and --extension-dir are mutually exclusive')
     if min(args.tokens, args.runs, args.parity_tokens) < 1:
@@ -127,6 +130,9 @@ def main():
         raise AssertionError('Measured MTP completions differ')
     if len({(r['accepted_draft_tokens'], r['rejected_draft_tokens']) for r in results}) != 1:
         raise AssertionError('Measured MTP acceptance counts differ')
+    if args.compare_plan:
+        from util.native_plan_validation import benchmark
+        benchmark([model, draft], lambda n: run(True, n), args.tokens, args.runs, args.output, None, 64)
 
 
 if __name__ == '__main__':

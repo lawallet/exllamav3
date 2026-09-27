@@ -13,7 +13,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from util.decode_dispatch_profile import DispatchProfile
+from util.glm_dispatch_profile import GlmDispatchProfile as DispatchProfile
 
 
 def main():
@@ -26,10 +26,16 @@ def main():
     p.add_argument('--profile-tokens', type=int, default=64)
     p.add_argument('--trace', action='store_true')
     p.add_argument('--extension-dir', type=Path)
+    p.add_argument('--package-dir', type=Path, help='Import an extracted wheel package and its extension')
     p.add_argument('--installed', action='store_true', help='Import installed package instead of checkout')
     p.add_argument('--ab', action='store_true', help='Check exact parity, then alternate stock/native measured runs')
+    p.add_argument('--compare-plan', action='store_true', help='Also benchmark bespoke versus plan on the same loaded model')
     p.add_argument('--output', type=Path, required=True)
     args = p.parse_args()
+    if args.package_dir and (args.extension_dir or args.installed):
+        p.error('--package-dir cannot be combined with --extension-dir or --installed')
+    if args.compare_plan and (not args.ab or os.environ.get('EXL3_NATIVE_PLAN') != '1'):
+        p.error('--compare-plan requires --ab and EXL3_NATIVE_PLAN=1')
     if min(args.tokens, args.runs, args.profile_tokens) < 1:
         p.error('token counts and runs must be positive')
     if args.installed:
@@ -39,6 +45,8 @@ def main():
         sys.path = [entry for entry in sys.path if Path(entry or '.').resolve() != ROOT]
     if args.extension_dir:
         sys.path.insert(1, str(args.extension_dir.resolve()))
+    if args.package_dir:
+        sys.path.insert(0, str(args.package_dir.resolve()))
     import torch
     import exllamav3
     import exllamav3_ext
@@ -107,6 +115,12 @@ def main():
             run(args.profile_tokens)
         name = f'dispatch-{int(enabled)}.json' if args.ab else 'dispatch.json'
         (args.output / name).write_text(json.dumps(dispatch.report(), indent=2), encoding='utf-8')
+    if args.compare_plan:
+        from util.native_plan_validation import benchmark
+        transformer._native_qwen_enabled = True
+        benchmark(model, run, args.tokens, args.runs, args.output, DispatchProfile, args.profile_tokens)
+    from util.native_plan_validation import memory_report
+    memory_report(model, args.output)
     if args.trace:
         with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
                                                torch.profiler.ProfilerActivity.CUDA]) as prof:

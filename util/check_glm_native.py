@@ -109,7 +109,12 @@ def check(model, cache, tokenizer, prompt, steps=128):
                 s.free()
         return records
     try:
-        stock, native = run(False), run(True)
+        stock = run(False)
+        from util.native_plan_validation import three_way_reference
+        bespoke = three_way_reference(model, run)
+        native = run(True)
+        if bespoke is not None and bespoke != native:
+            raise AssertionError('Exact bespoke/plan GLM parity failed')
         for step, (a, b) in enumerate(zip(stock, native)):
             if a != b:
                 raise AssertionError(f'Byte-exact GLM parity failed at step {step}: '
@@ -122,7 +127,7 @@ def check(model, cache, tokenizer, prompt, steps=128):
             assert get_native_block(blocks[0], x, params) is None, params
         assert get_native_block(blocks[0], x.expand(2, -1, -1, -1), {}) is None
         assert get_native_block(blocks[0], x.expand(-1, 2, -1, -1), {}) is None
-        return dict(steps=steps, native_blocks=len(blocks), exact=True,
+        return dict(steps=steps, native_blocks=len(blocks), exact=True, exact_bespoke_plan=bespoke is not None,
                     compared=['tokens', 'logits', 'all block residuals', 'routing selections/weights',
                               'final hidden', 'transfer inputs/outputs', 'positions',
                               'convolution/recurrent state', 'latent KV', 'indexer keys', 'pooled keys'],

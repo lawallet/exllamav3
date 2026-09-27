@@ -63,6 +63,7 @@
 #include "libtorch/mlp.h"
 #include "libtorch/blocksparse_mlp.h"
 #include "libtorch/qwen_block.h"
+#include "libtorch/block_plan.h"
 #include "libtorch/dsv4_compressor.h"
 #include "libtorch/dsv4_attn.h"
 #include "dsv4_compress.cuh"
@@ -284,6 +285,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/gated_rmsnorm_bc.h"
     #include "libtorch/mlp_bc.h"
     #include "libtorch/blocksparse_mlp_bc.h"
+    py::class_<BC_BlockPlan>(m, "BC_BlockPlan")
+        .def(py::init<std::vector<std::vector<at::Tensor>>, std::vector<int64_t>,
+             std::vector<double>, std::vector<double>, std::vector<int64_t>,
+             std::vector<std::vector<std::pair<int64_t,int64_t>>>, std::vector<at::Tensor>,
+             std::shared_ptr<BC_BlockSparseMLP>, int64_t, int64_t>())
+        .def("begin", &BC_BlockPlan::begin)
+        .def("middle", &BC_BlockPlan::middle)
+        .def("finish", &BC_BlockPlan::finish);
     py::class_<BC_GlmBlock>(m, "BC_GlmBlock")
         .def(py::init<std::vector<at::Tensor>, double, double, int64_t, int64_t, int64_t>(),
              py::arg("weights"), py::arg("norm_eps"), py::arg("hc_eps"), py::arg("iterations"), py::arg("rows") = 1, py::arg("batch") = 1)

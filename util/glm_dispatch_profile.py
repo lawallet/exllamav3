@@ -1,4 +1,7 @@
-"""GLM-only diagnostic instrumentation; never use for throughput measurements."""
+"""Native boundary/transfer diagnostics, shared by GLM and Qwen plan gates.
+
+Never use instrumentation for throughput measurements.
+"""
 from collections import Counter
 import sys
 
@@ -10,6 +13,8 @@ class GlmDispatchProfile(DispatchProfile):
         super().__init__(model, ranges)
         self.native_calls = Counter()
         self.transfers = Counter()
+        self.eligibility = Counter()
+        self.plan_invocations = 0
 
     def __enter__(self):
         self.old_profile = sys.getprofile()
@@ -28,6 +33,12 @@ class GlmDispatchProfile(DispatchProfile):
                 self.saved.append((module, name, module.__dict__.get(name), name in module.__dict__))
                 setattr(module, name, prepare)
             def profile(frame, event, arg):
+                if self.active and event == 'return' and frame.f_code.co_name == 'get_native_block':
+                    module = frame.f_globals.get('__name__', '')
+                    if module in ('exllamav3.modules.native_qwen', 'exllamav3.modules.native_glm'):
+                        self.eligibility[(module, 'fallback' if arg is None else 'native')] += 1
+                        if type(arg).__name__ == 'BC_BlockPlan':
+                            self.plan_invocations += 1
                 if self.active and event == 'c_call':
                     owner = getattr(arg, '__self__', None)
                     mod = getattr(arg, '__module__', '') or getattr(type(owner), '__module__', '')
@@ -45,6 +56,9 @@ class GlmDispatchProfile(DispatchProfile):
 
     def report(self):
         return dict(super().report(),
+            native_plan_invocations=self.plan_invocations,
+            native_fallbacks=sum(v for k, v in self.eligibility.items() if k[1] == 'fallback'),
+            eligibility=[dict(module=k[0], result=k[1], count=v) for k, v in self.eligibility.items()],
             native_calls=[dict(name=k, count=v, per_decode=v/max(1, self.tokens))
                           for k, v in self.native_calls.most_common()],
             transfers=[dict(module=k[0], source=k[1], destination=k[2], shape=k[3], dtype=k[4],

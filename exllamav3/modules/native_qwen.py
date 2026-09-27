@@ -4,6 +4,7 @@ from ..ext import exllamav3_ext as ext
 from .hyperconnections import GatedResidual
 from .block_sparse_mlp import BlockSparseMLP
 from .block_sparse_mlp_routing import _gate_t
+from . import native_plan
 
 
 def _mtp_eligible(owner, x, params):
@@ -80,7 +81,7 @@ def _batch_eligible(owner, x, params):
 def get_native_block(block, x, params):
     owner_ref = getattr(block, '_native_qwen_owner', None)
     owner = owner_ref() if owner_ref else None
-    if (owner is None or owner.loaded_tp or
+    if (owner is None or owner.loaded_tp or (native_plan.enabled and not native_plan.available) or
         not hasattr(ext, 'BC_QwenBlock') or x.ndim != 4 or x.shape[0] < 1 or
         x.dtype != torch.float32 or not x.is_cuda or not x.is_contiguous() or
         any(k in params for k in ('capture', 'quant_preserve', 'backend', 'export_state_layers',
@@ -116,22 +117,23 @@ def get_native_block(block, x, params):
         m.intermediate_size == 0 or m.num_local_experts != m.num_experts):
         return None
     rows = x.shape[0] * x.shape[1]
+    shape_key = (x.device, x.shape[0], x.shape[1], x.dtype) if native_plan.enabled else rows
     native = (getattr(block, '_native_qwen', None) if rows == 1 else
-              getattr(block, '_native_qwen_mtp', {}).get(rows))
+              getattr(block, '_native_qwen_mtp', {}).get(shape_key))
     if native is None:
         cfg = m.routing_cfg
         _gate_t(cfg)  # Same lazy router materialization as routing_std.
         if cfg.gate_i8 is None or cfg.router_bias is not None:
             return None
-        native = ext.BC_QwenBlock([
+        native = native_plan.qwen([
             a.fn_h, a.upx_h, a.w_h, h.fn_h, h.upx_h, h.w_h,
             cfg.gate_tensor, cfg.gate_tensor_t, cfg.gate_i8, cfg.gate_sb,
             cfg.router_logits_bsz1, cfg.selected_experts_bsz1, cfg.routing_weights_bsz1,
-        ], m.bc, a.rms_eps, h.rms_eps, *([rows] if rows > 1 else []))
+        ], m.bc, a.rms_eps, h.rms_eps, x.shape[0], x.shape[1], backend=ext)
         if rows == 1:
             block._native_qwen = native
         else:
             if not hasattr(block, '_native_qwen_mtp'):
                 block._native_qwen_mtp = {}
-            block._native_qwen_mtp[rows] = native
+            block._native_qwen_mtp[shape_key] = native
     return native

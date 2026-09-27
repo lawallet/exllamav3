@@ -23,10 +23,13 @@ def main():
     p.add_argument('--case',action='append',help='Run only named cases (for targeted follow-up validation)')
     p.add_argument('--regressions',action='store_true')
     p.add_argument('--benchmark',action='store_true')
+    p.add_argument('--compare-plan',action='store_true')
     p.add_argument('--skip-parity',action='store_true')
     p.add_argument('--runs',type=int,default=3)
     p.add_argument('--cache-tokens',type=int,default=5120)
     a=p.parse_args()
+    if a.compare_plan and (a.skip_parity or a.case or os.environ.get('EXL3_NATIVE_PLAN') != '1'):
+        p.error('--compare-plan requires full parity and EXL3_NATIVE_PLAN=1')
     if a.installed:
         sys.path=[s for s in sys.path if Path(s or '.').resolve()!=ROOT]
     elif a.extension_dir:
@@ -94,6 +97,9 @@ def main():
                              num_draft_tokens=4,dynamic_draft_tokens=False,record_draft_stats=True)
         check_mtp(model,draft,cache,dc,tokenizer,prompt,make_gen,a.output/'natural-regression',tokens=128)
         check_mtp(model,draft,cache,dc,tokenizer,prompt,make_gen,a.output/'forced-regression',tokens=64,force_rejections=True)
+    if a.compare_plan:
+        from util.native_plan_validation import benchmark_jobs
+        benchmark_jobs(common, run_jobs, a.suite, a.output, a.runs)
     if a.benchmark:
         required=('ordinary-2','ordinary-3','ordinary-4','ordinary-stagger','ordinary-stochastic',
                   'ordinary-page-crossing','mtp-2','mtp-3','mtp-stagger-forced','mtp-page-crossing')

@@ -1,5 +1,6 @@
 """Slow exact-parity checks, deliberately separate from timed generation."""
 import hashlib
+import json
 import torch
 
 
@@ -91,7 +92,11 @@ def check(model, cache, tokenizer, prompt, steps=128):
         for block, original in original_methods:
             block.forward = wrap(block, original)
         stock = run(False)
+        from util.native_plan_validation import three_way_reference
+        bespoke = three_way_reference(model, run)
         native = run(True)
+        if bespoke is not None and bespoke != native:
+            raise AssertionError('Exact bespoke/plan Qwen parity failed')
         used = sum(getattr(b, '_native_qwen', None) is not None for b in blocks)
         if used != len(blocks):
             raise AssertionError(f'Native path constructed for only {used}/{len(blocks)} blocks')
@@ -105,7 +110,8 @@ def check(model, cache, tokenizer, prompt, steps=128):
             assert get_native_block(blocks[0], x, params) is None, params
         assert get_native_block(blocks[0], x.expand(2, -1, -1, -1), {}) is None
         assert get_native_block(blocks[0], x.expand(-1, 2, -1, -1), {}) is None
-        return dict(steps=steps, native_blocks=used, exact_logits=True, exact_tokens=True,
+        return dict(steps=steps, native_blocks=used, exact_bespoke_plan=bespoke is not None,
+                    state_trace_sha256=hashlib.sha256(json.dumps(native, sort_keys=True).encode()).hexdigest(), exact_logits=True, exact_tokens=True,
                     exact_block_residuals=True, exact_recurrent_and_ple=True, exact_kv_and_qsa=True,
                     state_checkpoint_steps=[0, 1, 7, 31, steps - 1], fallback_checks=True)
     finally:

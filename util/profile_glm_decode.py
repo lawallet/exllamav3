@@ -27,10 +27,14 @@ def main():
     p.add_argument('--profile-tokens', type=int, default=32)
     p.add_argument('--trace', action='store_true')
     p.add_argument('--ab', action='store_true')
+    p.add_argument('--compare-plan', action='store_true', help='Also benchmark bespoke versus plan on the same loaded model')
+    p.add_argument('--smoke', action='store_true', help='Short development gate; not a release benchmark')
     p.add_argument('--extension-dir', type=Path)
     p.add_argument('--package-dir', type=Path, help='Extracted wheel directory; import its package and extension')
     args = p.parse_args()
-    if args.tokens < 1000 or args.runs < 3 or args.profile_tokens < 1:
+    if args.compare_plan and (not args.ab or os.environ.get('EXL3_NATIVE_PLAN') != '1'):
+        p.error('--compare-plan requires --ab and EXL3_NATIVE_PLAN=1')
+    if (not args.smoke and (args.tokens < 1000 or args.runs < 3)) or min(args.tokens, args.runs, args.profile_tokens) < 1:
         p.error('baseline requires >=1000 tokens, >=3 runs and positive profile tokens')
     if not args.ab and os.environ.get('EXL3_NATIVE_GLM_BLOCK', '0') != '0':
         p.error('This harness measures stock only; native benchmarking requires parity first')
@@ -127,6 +131,12 @@ def main():
             with DispatchProfile(model) as dispatch:
                 run(args.profile_tokens)
             save(f'dispatch-{int(enabled)}.json', dispatch.report())
+        if args.compare_plan:
+            from util.native_plan_validation import benchmark
+            transformer._native_glm_enabled = True
+            benchmark(model, run, args.tokens, args.runs, args.output, DispatchProfile, args.profile_tokens)
+        from util.native_plan_validation import memory_report
+        memory_report(model, args.output)
         if args.trace:
             with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
                                                    torch.profiler.ProfilerActivity.CUDA]) as prof:
