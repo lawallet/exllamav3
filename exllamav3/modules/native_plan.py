@@ -16,6 +16,18 @@ available = hasattr(ext, 'BC_BlockPlan')
 v2_available = (getattr(ext, 'native_block_plan_v2_abi', None) == 1 and
                 hasattr(ext, 'BC_BlockPlanV2'))
 NORM_ADD = 6
+RES_ADD_NORM, RES_ADD = 7, 8
+v2_residual_available = v2_available and getattr(ext, 'native_block_plan_v2_residual_ops', None) == 1
+
+
+def devstral(norms, batch, query):
+    """Pre-norm residual plumbing around two Python sublayers."""
+    return ext.BC_BlockPlanV2(
+        [(0, 1), (1, 1), (2, 1), (-1, 0), (-1, 0)],
+        [n.weight for n in norms],
+        [[n.rms_norm_eps, n.constant_bias, n.constant_scale] for n in norms],
+        [[(RMS_NORM, 0, 3, 0)], [(RES_ADD_NORM, 1, 4, 1)], [(RES_ADD, 2, 0, -1)]],
+        [3, 4, -1], batch, query, norms[0].weight.numel())
 
 
 def gemma(norms, batch, query):

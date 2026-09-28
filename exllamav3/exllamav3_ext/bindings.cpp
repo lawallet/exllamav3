@@ -287,6 +287,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/mlp_bc.h"
     #include "libtorch/blocksparse_mlp_bc.h"
     m.attr("native_block_plan_v2_abi") = 1;
+    m.attr("native_block_plan_v2_residual_ops") = 1;
     py::class_<BC_BlockPlanV2>(m, "BC_BlockPlanV2")
         .def(py::init<std::vector<std::pair<int64_t,int64_t>>, std::vector<at::Tensor>,
              std::vector<std::vector<double>>, std::vector<std::vector<std::vector<int64_t>>>,

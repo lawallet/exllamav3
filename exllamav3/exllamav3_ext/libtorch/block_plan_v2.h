@@ -5,7 +5,7 @@
 
 // Additive resolved-value frontend. V1's executor/ABI remains untouched.
 struct BC_BlockPlanV2 {
-    enum Op { RMS_NORM = 3, NORM_ADD = 6 };
+    enum Op { RMS_NORM = 3, NORM_ADD = 6, RES_ADD_NORM = 7, RES_ADD = 8 };
     struct Value {
         int64_t role;
         at::ScalarType dtype;
@@ -14,7 +14,7 @@ struct BC_BlockPlanV2 {
     struct Norm { at::Tensor weight; float eps, bias, scale; };
     struct Instruction;
     using Kernel = void (*)(const Instruction&);
-    struct Instruction { Kernel kernel; Value* src; Value* dst; Norm* norm; };
+    struct Instruction { Kernel kernel; Value* src; Value* dst; Norm* norm; Value* residual; };
     std::vector<Value> values;
     std::vector<Norm> norms;
     std::array<std::vector<Instruction>, 3> stages;
@@ -32,4 +32,6 @@ private:
     at::Tensor execute(size_t stage, const at::Tensor& x, const at::Tensor& y);
     static void norm(const Instruction& op);
     static void norm_add(const Instruction& op);
+    static void res_add_norm(const Instruction& op);
+    static void res_add(const Instruction& op);
 };

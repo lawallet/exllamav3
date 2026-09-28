@@ -87,6 +87,7 @@ class TransformerBlock(Module):
         return [a, m]
 
     def load(self, device: torch.device, **kwargs):
+        self._native_devstral = {}
         self._native_gemma = {}
         self._native_deepseek = {}
         self._native_glm_mtp = {}
@@ -123,6 +124,7 @@ class TransformerBlock(Module):
             )
 
     def unload(self):
+        self._native_devstral = {}
         self._native_gemma = {}
         self._native_deepseek = {}
         self._native_glm_mtp = {}

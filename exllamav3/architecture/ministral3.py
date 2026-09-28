@@ -54,3 +54,5 @@ class Ministral3Model(Mistral3Model):
         **kwargs
     ):
         super().__init__(config, key_prefix = "", **kwargs)
+        from ..modules.native_devstral import register
+        register(self)

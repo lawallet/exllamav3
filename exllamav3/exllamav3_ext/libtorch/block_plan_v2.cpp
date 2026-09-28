@@ -42,11 +42,13 @@ BC_BlockPlanV2::BC_BlockPlanV2(std::vector<std::pair<int64_t,int64_t>> specs,
         for (const auto& ins:code[s]) {
             TORCH_CHECK(ins.size()==4, "Block plan v2: instruction arity");
             auto op=ins[0], src=ins[1], dst=ins[2], n=ins[3];
-            TORCH_CHECK((op==RMS_NORM || op==NORM_ADD) && src>=0 && src<specs.size() &&
-                dst>=0 && dst<specs.size() && n>=0 && n<weights.size(), "Block plan v2: invalid operand");
+            TORCH_CHECK((op==RMS_NORM || op==NORM_ADD || op==RES_ADD_NORM || op==RES_ADD) &&
+                src>=0 && src<specs.size() && dst>=0 && dst<specs.size() &&
+                (op==RES_ADD ? n==-1 : n>=0 && n<weights.size()), "Block plan v2: invalid operand");
             TORCH_CHECK(live[src] && src!=dst, "Block plan v2: uninitialized/aliased operand");
-            TORCH_CHECK((op==RMS_NORM && specs[dst].first==-1) ||
-                (op==NORM_ADD && specs[dst].first==0), "Block plan v2: invalid destination");
+            TORCH_CHECK(((op==RMS_NORM || op==RES_ADD_NORM) && specs[dst].first==-1) ||
+                ((op==NORM_ADD || op==RES_ADD) && specs[dst].first==0), "Block plan v2: invalid destination");
+            TORCH_CHECK(op!=RES_ADD_NORM || specs[src].first!=0, "Block plan v2: residual source alias");
             live[dst]=true;
         }
         auto r=returns[s];
@@ -69,7 +71,9 @@ BC_BlockPlanV2::BC_BlockPlanV2(std::vector<std::pair<int64_t,int64_t>> specs,
     for (auto& v:values) if (v.role>=0) external[v.role]=&v;
     for (size_t s=0; s<3; ++s) {
         for (const auto& ins:code[s]) stages[s].push_back({
-            ins[0]==RMS_NORM ? &norm : &norm_add, &values[ins[1]], &values[ins[2]], &norms[ins[3]]});
+            ins[0]==RMS_NORM ? &norm : ins[0]==NORM_ADD ? &norm_add :
+                ins[0]==RES_ADD_NORM ? &res_add_norm : &res_add,
+            &values[ins[1]], &values[ins[2]], ins[3]>=0 ? &norms[ins[3]] : nullptr, external[0]});
         if (returns[s]>=0) outputs[s]=&values[returns[s]];
     }
 }
@@ -113,4 +117,11 @@ void BC_BlockPlanV2::norm(const Instruction& op) {
 void BC_BlockPlanV2::norm_add(const Instruction& op) {
     rms_norm(op.src->tensor,op.norm->weight,op.dst->tensor,op.norm->eps,
              op.norm->bias,op.norm->scale,false,true,1);
+}
+void BC_BlockPlanV2::res_add_norm(const Instruction& op) {
+    rms_norm_res_in(op.src->tensor,op.norm->weight,op.dst->tensor,op.residual->tensor,
+                    op.norm->eps,op.norm->bias,op.norm->scale);
+}
+void BC_BlockPlanV2::res_add(const Instruction& op) {
+    op.dst->tensor.add_(op.src->tensor);
 }
