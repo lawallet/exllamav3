@@ -7,6 +7,7 @@ from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, ML
 from .hyperconnections import HyperConnection
 from ..util import profile_opt
 import os
+from . import native_plan
 
 _native_qwen_enabled = os.environ.get('EXL3_NATIVE_QWEN_BLOCK', '0') == '1'
 _native_glm_enabled = os.environ.get('EXL3_NATIVE_GLM_BLOCK', '0') == '1'
@@ -46,6 +47,7 @@ class TransformerBlock(Module):
         self.mlp_hc = mlp_hc
         self.qbits_key = qbits_key
         self.out_dtype = out_dtype
+        self._native_plan_get = None
 
         self.key_layer_scalar = key_layer_scalar
         self.key_attn_resid_scalar = key_attn_resid_scalar
@@ -85,6 +87,8 @@ class TransformerBlock(Module):
         return [a, m]
 
     def load(self, device: torch.device, **kwargs):
+        self._native_gemma = {}
+        self._native_deepseek = {}
         self._native_glm_mtp = {}
         self._native_glm_batch = {}
         self._native_glm = None
@@ -119,6 +123,8 @@ class TransformerBlock(Module):
             )
 
     def unload(self):
+        self._native_gemma = {}
+        self._native_deepseek = {}
         self._native_glm_mtp = {}
         self._native_glm_batch = {}
         self._native_glm = None
@@ -176,6 +182,25 @@ class TransformerBlock(Module):
 
         export_state = params.get("export_state_layers")
         export_state = export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0
+
+        if native_plan.enabled and self._native_plan_get is not None:
+            native = self._native_plan_get(self, x, params)
+            if native is not None:
+                y = self.attn.forward(native.begin(x), params)
+                y = native.middle(x, y)
+                if x.ndim == 3:
+                    params['residual'] = x
+                y = self.mlp.forward(y, params)
+                native.finish(x, y)
+                if export_state:
+                    s = params.get("export_states")
+                    if not s:
+                        s = params["export_states"] = []
+                    exported = x.mean(dim=2) if x.ndim == 4 else x
+                    s.append(exported.half().clamp_(-65504.0, 65504.0))
+                if x.ndim == 3 and self.layer_scalar_f is not None:
+                    x *= self.layer_scalar_f
+                return to2(x, out_dtype, self.out_dtype)
 
         y_resid = None  # pending attn output whose residual add is folded into the MLP input norm
 

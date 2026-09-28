@@ -223,6 +223,8 @@ class DeepseekV4MTPModel(Model):
 
         # Activate all experts during any calibrated capture pass
         self.calibration_all_experts = True
+        from ..modules.native_deepseek import register
+        register(self)
 
 
     def attach_to(self, target):

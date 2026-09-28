@@ -64,6 +64,7 @@
 #include "libtorch/blocksparse_mlp.h"
 #include "libtorch/qwen_block.h"
 #include "libtorch/block_plan.h"
+#include "libtorch/block_plan_v2.h"
 #include "libtorch/dsv4_compressor.h"
 #include "libtorch/dsv4_attn.h"
 #include "dsv4_compress.cuh"
@@ -285,6 +286,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/gated_rmsnorm_bc.h"
     #include "libtorch/mlp_bc.h"
     #include "libtorch/blocksparse_mlp_bc.h"
+    m.attr("native_block_plan_v2_abi") = 1;
+    py::class_<BC_BlockPlanV2>(m, "BC_BlockPlanV2")
+        .def(py::init<std::vector<std::pair<int64_t,int64_t>>, std::vector<at::Tensor>,
+             std::vector<std::vector<double>>, std::vector<std::vector<std::vector<int64_t>>>,
+             std::vector<int64_t>, int64_t, int64_t, int64_t>())
+        .def("begin", &BC_BlockPlanV2::begin)
+        .def("middle", &BC_BlockPlanV2::middle)
+        .def("finish", &BC_BlockPlanV2::finish);
     py::class_<BC_BlockPlan>(m, "BC_BlockPlan")
         .def(py::init<std::vector<std::vector<at::Tensor>>, std::vector<int64_t>,
              std::vector<double>, std::vector<double>, std::vector<int64_t>,

@@ -11,7 +11,7 @@ def backend(model, plan):
         for block in (b for m in models for b in m.modules):
             for name in ('_native_qwen', '_native_glm'):
                 if hasattr(block, name): setattr(block, name, None)
-            for name in ('_native_qwen_mtp', '_native_glm_mtp', '_native_glm_batch'):
+            for name in ('_native_qwen_mtp', '_native_glm_mtp', '_native_glm_batch', '_native_deepseek', '_native_gemma'):
                 if hasattr(block, name): setattr(block, name, {})
     clear()
     native_plan.enabled = plan

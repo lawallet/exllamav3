@@ -419,6 +419,9 @@ class Gemma4TextModel(Model):
 
         self.logit_layer_idx = len(self.modules) - 1
 
+        from ..modules.native_gemma import register
+        register(self)
+
         if config.enable_moe_block:
             self.calibration_all_experts = True
 

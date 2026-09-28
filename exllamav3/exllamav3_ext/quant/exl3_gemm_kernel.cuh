@@ -231,9 +231,28 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             {
                 int lock_offs = blockIdx.z * size_n / 128;
 
-                exl3_gemm_kernel_inner
-                <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false>
-                (A_, B, C_, MIN(size_m_, 16), size_k, n_j, locks + lock_offs, nullptr, n_stride_j);
+                // The launch shape is selected using the carrier's maximum N.
+                // A narrower per-matrix N need not tile that shape (e.g. 256
+                // columns in a 512-column launch). The inner kernel uses full
+                // tiles only; otherwise it skips columns and the output Hadamard
+                // transform reads stale C. All EXL3 output widths are 128-aligned.
+                // Keep the selected shape for compatible matrices and use the
+                // same K tile/thread layout with a 128-column tile for the rest.
+                if constexpr (TILESIZE_N > 128)
+                {
+                    if (n_j % TILESIZE_N)
+                        exl3_gemm_kernel_inner
+                        <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, 128, SH_STAGES, FRAG_STAGES, false>
+                        (A_, B, C_, MIN(size_m_, 16), size_k, n_j, locks + lock_offs, nullptr, n_stride_j);
+                    else
+                        exl3_gemm_kernel_inner
+                        <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false>
+                        (A_, B, C_, MIN(size_m_, 16), size_k, n_j, locks + lock_offs, nullptr, n_stride_j);
+                }
+                else
+                    exl3_gemm_kernel_inner
+                    <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false>
+                    (A_, B, C_, MIN(size_m_, 16), size_k, n_j, locks + lock_offs, nullptr, n_stride_j);
             }
 
             A_ += 16 * size_k;

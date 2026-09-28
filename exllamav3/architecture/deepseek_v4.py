@@ -277,6 +277,8 @@ class DeepseekV4Model(Model):
             self.caps.update({"mm_exact_chunks": True})
         from ..cache.dsa import DSV4State
         self.recurrent_state_cls = DSV4State
+        from ..modules.native_deepseek import register
+        register(self)
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:

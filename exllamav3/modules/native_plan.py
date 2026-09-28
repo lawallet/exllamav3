@@ -1,6 +1,7 @@
 """Load/shape-time plan emitters. No Python IR interpretation during execution.
 
-EXL3_NATIVE_PLAN=1 selects plans within the existing native architecture flags.
+EXL3_NATIVE_PLAN=1 selects registered new-architecture plans directly. Qwen and
+GLM retain their existing architecture flags for bespoke/reference selection.
 Absent/older extension support falls back to stock before any native mutation.
 """
 import os
@@ -12,6 +13,21 @@ GR_MIX, HC_MIX, APPLY, RMS_NORM, ROUTE, MOE = range(6)
 # Extension identity is fixed for the process. Resolve capability once, not
 # through an extra Python function call for every block/token.
 available = hasattr(ext, 'BC_BlockPlan')
+v2_available = (getattr(ext, 'native_block_plan_v2_abi', None) == 1 and
+                hasattr(ext, 'BC_BlockPlanV2'))
+NORM_ADD = 6
+
+
+def gemma(norms, batch, query):
+    """Single residual, two Python sublayers, explicit independent norm operands."""
+    return ext.BC_BlockPlanV2(
+        [(0, 1), (1, 0), (2, 1), (-1, 0), (-1, 0)],
+        [n.weight for n in norms],
+        [[n.rms_norm_eps, n.constant_bias, n.constant_scale] for n in norms],
+        [[(RMS_NORM, 0, 3, 0)],
+         [(NORM_ADD, 1, 0, 1), (RMS_NORM, 0, 4, 2)],
+         [(NORM_ADD, 2, 0, 3)]],
+        [3, 4, -1], batch, query, norms[0].weight.numel())
 
 
 def glm_placement(owner, draft=None):
@@ -61,6 +77,17 @@ def glm(weights, batch, query):
     return ext.BC_BlockPlan(
         [weights[:4], weights[4:]], [HC_MIX, HC_MIX], [1e-5, 1e-5],
         [1e-6, 1e-6], [20, 20],
+        [[(HC_MIX, 0), (RMS_NORM, 0)],
+         [(APPLY, 0), (HC_MIX, 1), (RMS_NORM, 1)], [(APPLY, 1)]],
+        [], None, batch, query)
+
+
+def deepseek(sites, batch, query):
+    """Two HC sites around explicit Python attention and MoE boundaries."""
+    return ext.BC_BlockPlan(
+        [[h.fn_h, h.base, h.scale, n.weight] for h, n in sites],
+        [HC_MIX, HC_MIX], [h.rms_eps for h, _ in sites],
+        [h.hc_eps for h, _ in sites], [h.sinkhorn_iters for h, _ in sites],
         [[(HC_MIX, 0), (RMS_NORM, 0)],
          [(APPLY, 0), (HC_MIX, 1), (RMS_NORM, 1)], [(APPLY, 1)]],
         [], None, batch, query)
