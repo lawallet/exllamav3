@@ -36,7 +36,7 @@ cannot express Laguna's sigmoid/bias/scaling semantics. NORM_ADD is postnorm
 addition, not the residual-in norm required here.
 
 Outcome B: retain stock routing/MoE inside the Python sublayer boundary. For
-rows<=12, inspection confirms BC_BlockSparseMLP.run_bszN already executes fused
+rows<=8, inspection confirms BC_BlockSparseMLP.run_bszN already executes fused
 experts and the shared-expert combine (`bc_sh_exp=True` on every sparse layer).
 There is no Python per-expert loop or sort/regroup in this decode tier. A major
 remaining routing orchestration bottleneck has not been demonstrated, so the
@@ -44,6 +44,12 @@ prompt's condition for a configurable routing expansion is not met. No routing
 design/API was implemented. Native routing kernels still execute, but routing
 is not an IR instruction. Do not attribute any measured gain to newly native
 routing; there is none. A routing-isolation benchmark does not apply.
+
+B2Q6 has12 rows and exceeds the native expert decode tier (MAX_BSZN=8).
+It retains stock grouped/fused/reconstruct dispatch, including token regrouping
+and separate shared-expert handling. V2 still handles its norm/residual stages.
+No claim is made that all supported multi-query expert orchestration is fused.
+The ordinary B1/B4 throughput experiment uses the already-fused tier.
 
 ## Safety and ownership
 
@@ -82,8 +88,11 @@ Short decode: B1/B2/B3/B4 Q1, B1Q5, B2Q6, 32 steps each; all exact logits,
 tokens, normalized sublayer inputs, attention outputs, route IDs/weights, fused
 expert results, combined MLP outputs, block/transfer/export boundaries and
 logically valid global KV/SWA state. Each supported shape constructs48 plans
-and invokes1536 begin/middle/finish stages, plus1504 stock router/native-expert
-calls. No unexpected native fallback. Q7 is all stock. One unsupported norm
+and invokes1536 begin/middle/finish stages, plus1504 stock router calls.
+Shapes with at most8 rows also make1504 run_bszN calls and compare its direct
+expert output. B2Q6 uses the stock larger-row expert path; its route IDs/weights,
+combined MLP output and all block/state boundaries compare exactly. No unexpected
+IR fallback. Q7 uses stock residual/norm stages. One unsupported norm
 configuration falls back for one block while the other47 remain native.
 Identity rebinding reconstructs a plan. All seven generator cases passed: B1..4,
 staggered/replacement, live cancellation/replacement and seeded sampling.

@@ -41,10 +41,13 @@ intermediate downscaling (interm_div128); the effective loaded route scale is320
 Replacing this with v1 ROUTE would be incorrect. Existing MOE's run_bszN accepts
 the selections, but v1's site model and router opcode do not express Laguna.
 
-For decode rows<=12 the stock MoE already invokes deterministic native routing
+For decode rows<=8 the stock MoE already invokes deterministic native routing
 and BC_BlockSparseMLP.run_bszN, with shared-expert execution/combine handled
 inside that native object. It does not Python-loop/sort/regroup experts in this
-regime. Therefore a major remaining Python routing bottleneck has not been
+regime. B2Q6 exceeds this expert tier and retains the stock grouped/fused/reconstruct
+dispatch and shared-expert path; its norm/residual stages still enter v2.
+The ordinary B1/B4 performance experiment stays within the fused decode tier.
+Therefore a major remaining ordinary-decode Python routing bottleneck has not been
 demonstrated: retain the boundary and benchmark the existing v2 plumbing.
 No configured-routing opcode, integer value slots, ABI or kernel changes are
 justified in this iteration. DeepSeek's sqrt(softplus)/hash routing remains

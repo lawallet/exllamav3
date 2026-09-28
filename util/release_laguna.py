@@ -48,7 +48,7 @@ elif a.phase=='gates':
             assert stock['records']==plan['records'] and stock['boundaries']==plan['boundaries']
             assert plan['counts'].get('begin',0)==(48*steps if q<=6 else 0)
             assert plan['counts']['python_route']==47*steps
-            assert plan['counts']['python_moe_native_calls']==47*steps
+            assert plan['counts'].get('python_moe_native_calls',0)==(47*steps if b*q<=8 else 0)
     for name in ('short-201','short-20'): assert read(V/a.campaign/name/'reload.json')['exact']
     assert read(V/a.campaign/'short-20/topology.json')['exact']
     for i in (4,5):
