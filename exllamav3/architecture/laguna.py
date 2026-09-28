@@ -258,6 +258,9 @@ class LagunaModel(Model):
             })
             self.recurrent_state_cls = SWAState
 
+        from ..modules.native_laguna import register
+        register(self)
+
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
