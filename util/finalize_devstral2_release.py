@@ -32,6 +32,8 @@ proof['extracted_validation']=str(a.validation.resolve())
 (out/'package-proof.json').write_text(json.dumps(proof,indent=2))
 shutil.copy2(a.package/'checkout-gates.json',out/'checkout-gates.json')
 shutil.copy2(a.validation/'runs.json',out/'extracted-wheel-runs.json')
+if (a.validation/'payload-equivalence.json').exists():
+    shutil.copy2(a.validation/'payload-equivalence.json',out/'payload-equivalence.json')
 subprocess.run(['git','archive','--format=zip','--output='+str(out/'source.zip'),commit],cwd=ROOT,check=True)
 subprocess.run(['git','bundle','create',str(out/'repository.bundle'),'--all'],cwd=ROOT,check=True)
 subprocess.run(['git','bundle','verify',str(out/'repository.bundle')],cwd=ROOT,check=True)
@@ -91,6 +93,9 @@ short decode, cancellation/page reuse and topology checks passed; its broad
 historical campaign was not repeated. Extracted-wheel gates cover Devstral sites/short/reload/
 topology, Gemma sites/short, and ordinary DeepSeek/Qwen/GLM compatibility.
 Each wrapper verified product and native imports came from the extracted wheel.
+If checks were carried forward from an earlier candidate after a documentation/
+harness-only correction, payload-equivalence.json proves every wheel member
+byte-identical; the original import logs retain their original extraction paths.
 
 Restore source with `git clone repository.bundle restored` and check out
 `{a.tag}`, or extract source.zip. SHA256SUMS.txt covers the release artifacts.

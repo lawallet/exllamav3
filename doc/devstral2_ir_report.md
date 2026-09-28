@@ -215,6 +215,24 @@ artifacts include the wheel, this report/mapping, v2 historical reports,
 source archive, verified Git bundle, validation summaries and SHA256 manifest.
 Large evidence trees remain at `native-results/devstral2`.
 
+The initial extracted-wheel Qwen launch exposed an unsafe harness invocation:
+the profiler sized its cache from `--tokens 64` plus the 173-token prompt
+(256 positions), while its parity oracle always runs 128 steps (301 positions
+needed). Stock execution hit an illegal CUDA access before native comparison.
+The failure and metadata remain in `wheel-validation/qwen-short.log`.
+Using `--tokens 128` allocates 512 positions and passes the unchanged exact
+128-step stock/bespoke/plan checks. The wheel driver now sizes Qwen for128 and
+GLM for256 to cover their fixed parity oracles. This is a validation invocation
+fix; no product source or native binary changed, and no assertion was relaxed.
+
+The source checkpoint was updated only for that harness correction and its
+documentation. Packaging reuses the same native binary and verified product
+sources. When successful checks from the first candidate are retained, the
+release includes a comparison proving every ZIP member's uncompressed bytes
+identical between candidate wheels (only container timestamps may differ).
+The failed Qwen gate is rerun with the corrected capacity; GLM then completes
+the remaining package gate. Original failure evidence is never overwritten.
+
 Approximately 50 minutes elapsed from the first inspection helper through
 checkout validation; final packaging/verification elapsed time is recorded
 in the release metadata. Token/credit usage is not exposed. This includes
