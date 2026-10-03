@@ -86,9 +86,36 @@ historical binary is inferred from correctness checks.
 
 ## Validation and release status
 
-Integration in progress. Do not treat this branch as a validated checkpoint yet.
-Initial existing native guards: 135 passed. Expanded CPU guard suite: 155 passed.
-The rebuilt-extension suite additionally exercises exact linked-GR primitive parity.
+All 17 checkout gates passed against integration commit
+`3389c059563bb3fca00d3e29e20e30a781882b3f`. The release-record commit changes
+documentation/tooling only; packaging checks the same product-source hashes.
+Evidence: `native-results/v1.5.4-integration/validation-r1`.
+
+| Gate | Result |
+| --- | --- |
+| Native/dispatch guards, including linked stock/native GR GPU parity | 158 passed |
+| Shared HostPool, checkpoint interval, job and GR tests | 23 passed |
+| MGEMM variable-width, row-tile and sliced-output regression | 192 cases passed on CUDA 0; 192 on CUDA 1 |
+| GLM, DeepSeek and Gemma primitive/site checks | Passed |
+| Qwen v1 ordinary | 128 steps; exact stock/bespoke/plan logits, tokens, block residuals, recurrent/PLE and KV/QSA state |
+| DeepSeek v1 ordinary | Exact B1/B2/B3/B4 Q1, B1/B2 Q6; reload and fallback checks passed |
+| Gemma v2 ordinary | Exact B1/B2/B3/B4 Q1, B1 Q5, B2 Q6, Q7 fallback; reload passed |
+| GLM MTP | Natural: 3,456 exact events; forced rejection: 4,621 exact events; 64 tokens each |
+| Qwen MTP | Natural: 1,307 exact events; forced rejection: 2,170 exact events; 64 tokens each |
+| Qwen concurrency | Exact B2/B3/B4, staggered arrivals, stochastic sampling and page crossing |
+| DeepSeek MTP | Ordinary and forced-rejection generator cases passed |
+| Gemma reuse | Generator case 5 passed, including page/slot reuse |
+| Devstral and Laguna | Exact seven-shape short regressions, including Q7 stock fallback |
+
+Qwen concurrency's existing three-pair performance gate passed. Plan versus
+bespoke median aggregate throughput: B2 107.15 versus 106.99 tokens/s (+0.154%);
+B3 133.84 versus 133.84 (-0.003%); B4 154.70 versus 155.32 (-0.396%). These are
+comparisons within 1.5.4, not against the old 1.5.1 wheel. Single-pair ordinary
+Qwen measurements are retained as smoke evidence, not a stable speedup claim.
+
+The isolated build succeeded for sm_89 and sm_120. Initial CPU-only runs also
+passed (135 original guards, 155 expanded guards, 13 upstream unit tests), and
+270 Python files parsed successfully before the compiled-runtime campaign.
 
 Reproduce the isolated build with `util/build_v154_integration.bat`; it uses the
 existing Python 3.13 / Torch 2.9.0+cu128 / CUDA 12.8 / MSVC workflow and builds
@@ -109,6 +136,31 @@ Laguna packaging workflow, with the integration version. It stages the tested
 binary without recompilation and verifies wheel payload hashes against source
 and extension inputs. Production installation is outside this release workflow.
 
-Pending: compiled extension, GPU/model results, final wheel, extracted-wheel
-validation, checkpoint tag and artifact hashes. Historical 1.5.1 results do not
-stand in for these checks; old release documents describe their original tags.
+The finalizer requires extracted-wheel Qwen three-way and Gemma v2 parity to
+pass before producing a validated release directory. Its generated README,
+`checkpoint.json`, `package-proof.json` and hash manifest record the final
+commit, tag, wheel identity and extracted-wheel results.
+
+Release paths under `native-results/v1.5.4-integration`:
+
+- Extension: `extension/exllamav3_ext.cp313-win_amd64.pyd`.
+- Checkout gates: `checkout-gates.json`.
+- Candidate wheel and extraction: `package/wheels` and `package/extracted`.
+- Extracted-wheel results: `wheel-validation`.
+- Final checkpoint: `release`, with wheel, source ZIP, validation ZIP, Git bundle,
+  README, package proof, checkpoint metadata and SHA-256 manifest.
+- Checkpoint tag: `native-plan-v1.5.4-integration-v1`.
+
+## Remaining scope and limitations
+
+No known correctness failures remain in the completed checkout gates. This is
+representative integration validation, not a rerun of every historical campaign.
+The 32K/64K campaigns, full long-context architecture campaigns, TP, CPU offload,
+external DFlash, newly added upstream architectures and other GPU architectures
+were not model-validated here. Their upstream changes were retained. Existing
+native eligibility restrictions remain in force. Historical Laguna's two-GPU
+B4 performance limitation is not cleared by this short regression campaign.
+
+The wheel is staged for explicit deployment; the production TabbyAPI environment
+is not reinstalled or upgraded. Old checkpoint tags, binaries and release reports
+remain intact. To return to the original source, use `git switch native-laguna-ir-v2`.

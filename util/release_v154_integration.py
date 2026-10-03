@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIRED = {'guards', 'shared', 'mgemm-0', 'mgemm-1', 'glm-sites', 'deepseek-sites',
@@ -79,6 +80,26 @@ else:
         version='1.5.4+nativeplan.v2.integration1', installed=False,
         validation=[str(v.resolve()) for v in a.validation], wheel_validation=str(a.wheel_validation.resolve()))
     (out/'checkpoint.json').write_text(json.dumps(metadata, indent=2))
+    with (out/'README.md').open('a') as report:
+        report.write('\n## Finalized release\n\n'
+            f'Checkpoint: `{a.tag}` at `{commit}`.\n\n'
+            'All required checkout gates passed. Extracted-wheel Qwen three-way\n'
+            'parity and Gemma v2 parity passed; all product imports were verified\n'
+            'inside the extraction. The wheel contains the exact tested extension.\n\n'
+            f'Wheel: `{wheel.name}`\n\n'
+            f'Wheel SHA-256: `{sha(wheel)}`\n\n'
+            f'Extension SHA-256: `{proof["extension_sha256"]}`\n\n'
+            'No production installation was performed. See `checkpoint.json`,\n'
+            '`checkout-gates.json`, `package-proof.json`, `validation.zip`, and\n'
+            '`SHA256SUMS.txt` for identity and validation evidence.\n')
+    with zipfile.ZipFile(out/'validation.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
+        for directory in [*a.validation, a.wheel_validation]:
+            for path in directory.rglob('*'):
+                if path.is_file():
+                    archive.write(path, directory.name+'/'+path.relative_to(directory).as_posix())
+        evidence = ROOT/'native-results/v1.5.4-integration'
+        for name in ('runtime.json', 'build.log', 'upstream-files.txt', 'upstream-commits.txt', 'upstream.patch'):
+            archive.write(evidence/name, name)
     subprocess.run(['git', 'archive', '--format=zip', '--output='+str(out/'source.zip'), commit], cwd=ROOT, check=True)
     subprocess.run(['git', 'bundle', 'create', str(out/'repository.bundle'), '--all'], cwd=ROOT, check=True)
     subprocess.run(['git', 'bundle', 'verify', str(out/'repository.bundle')], cwd=ROOT, check=True)
