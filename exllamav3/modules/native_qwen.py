@@ -82,10 +82,11 @@ def get_native_block(block, x, params):
     owner_ref = getattr(block, '_native_qwen_owner', None)
     owner = owner_ref() if owner_ref else None
     if (owner is None or owner.loaded_tp or (native_plan.enabled and not native_plan.available) or
-        not hasattr(ext, 'BC_QwenBlock') or x.ndim != 4 or x.shape[0] < 1 or
+        not hasattr(ext, 'BC_QwenBlock') or getattr(ext, 'native_qwen_unfolded_gr', 0) != 1 or
+        x.ndim != 4 or x.shape[0] < 1 or
         x.dtype != torch.float32 or not x.is_cuda or not x.is_contiguous() or
         any(k in params for k in ('capture', 'quant_preserve', 'backend', 'export_state_layers',
-                                  'activate_all_experts', 'loras')) or
+                                  'activate_all_experts', 'capture_sens', 'loras')) or
         any(params.get(k) for k in ('prefill', 'tp_warmup', 'autosplit_measure', 'layer_instance'))):
         return None
     if x.shape[0] != 1 and not _batch_eligible(owner, x, params):
@@ -114,6 +115,7 @@ def get_native_block(block, x, params):
         any(getattr(m, k) is not None for k in ('router_pre_norm', 'routed_pre_norm', 'routed_post_norm',
             'shared_experts_post_norm', 'latent_in', 'latent_out', 'per_expert_scale')) or
         (m.shared_experts is not None and not m.bc_sh_exp) or
+        getattr(m, 'interm_div', 1.0) != 1.0 or
         m.intermediate_size == 0 or m.num_local_experts != m.num_experts):
         return None
     rows = x.shape[0] * x.shape[1]
@@ -126,7 +128,8 @@ def get_native_block(block, x, params):
         if cfg.gate_i8 is None or cfg.router_bias is not None:
             return None
         native = native_plan.qwen([
-            a.fn_h, a.upx_h, a.w_h, h.fn_h, h.upx_h, h.w_h,
+            a.proj_h[:a.proj_m], a.upx_h, a.w_h,
+            h.proj_h[:h.proj_m], h.upx_h, h.w_h,
             cfg.gate_tensor, cfg.gate_tensor_t, cfg.gate_i8, cfg.gate_sb,
             cfg.router_logits_bsz1, cfg.selected_experts_bsz1, cfg.routing_weights_bsz1,
         ], m.bc, a.rms_eps, h.rms_eps, x.shape[0], x.shape[1], backend=ext)

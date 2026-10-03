@@ -38,7 +38,7 @@ at::Tensor BC_QwenBlock::begin(const at::Tensor& x)
                 x.scalar_type() == at::kFloat && x.is_contiguous() &&
                 x.device() == weights[0].device(), "Qwen block: invalid residual stack");
     c10::cuda::CUDAGuard guard(x.device());
-    gr_mix(x.view({rows, x.size(2), x.size(3)}), weights[0], weights[1], weights[2],
+    gr_mix(x.view({rows, x.size(2), x.size(3)}), c10::nullopt, weights[0], weights[1], weights[2],
            attn_eps, attn_dots, attn_post, attn_mixed);
     // Residual/router rows are independent, but attention must retain (B, Q)
     // so paged attention and recurrence select each sequence's own cache/slot.
@@ -52,11 +52,11 @@ void BC_QwenBlock::finish(at::Tensor x, const at::Tensor& attention_output)
     auto y = attention_output.reshape({rows, x.size(3)}).contiguous();
     // Consume attention gates before mixing the updated residual. No kernel math,
     // quantization, stream ordering, or cache operations change here.
-    hc_apply(streams, y, attn_post, c10::nullopt);
-    gr_mix(streams, weights[3], weights[4], weights[5], mlp_eps,
+    hc_apply(streams, y, attn_post, c10::nullopt, c10::nullopt, c10::nullopt);
+    gr_mix(streams, c10::nullopt, weights[3], weights[4], weights[5], mlp_eps,
            mlp_dots, mlp_post, mlp_mixed);
     routing_std(mlp_mixed, weights[6], weights[10], weights[11], weights[12],
                 c10::nullopt, weights[7], c10::nullopt, weights[8], weights[9]);
     moe->run_bszN(mlp_mixed, weights[11], weights[12]);
-    hc_apply(streams, moe->out_bszn.slice(0, 0, rows), mlp_post, c10::nullopt);
+    hc_apply(streams, moe->out_bszn.slice(0, 0, rows), mlp_post, c10::nullopt, c10::nullopt, c10::nullopt);
 }

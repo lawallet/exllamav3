@@ -46,7 +46,7 @@ void BC_GlmBlock::apply(const at::Tensor& x, const at::Tensor& y) {
     TORCH_CHECK(y.device() == x.device() && y.is_contiguous() &&
                 y.sizes() == at::IntArrayRef({batch, q_len, 4096}) &&
                 (y.scalar_type() == at::kFloat || y.scalar_type() == at::kHalf), "GLM: invalid sublayer output");
-    hc_apply(x.view({rows, 4, 4096}), y.view({rows, 4096}), post, comb);
+    hc_apply(x.view({rows, 4, 4096}), y.view({rows, 4096}), post, comb, c10::nullopt, c10::nullopt);
 }
 
 at::Tensor BC_GlmBlock::begin(const at::Tensor& x) {

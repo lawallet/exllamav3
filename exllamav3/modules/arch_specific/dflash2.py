@@ -281,10 +281,18 @@ class DFlash2Selector(Module):
     @override
     def load(self, device: torch.device, **kwargs):
         super().load(device, **kwargs)
+        # Older trainers append .weight to the bare codebook keys;
+        # try bare first, fall back to suffixed (same bytes either way).
         self.pred_codebook = self.config.stc.get_tensor(
-            self.key_pred, self.device, optional = False, allow_bf16 = True)
+            self.key_pred, self.device, optional = True, allow_bf16 = True)
+        if self.pred_codebook is None:
+            self.pred_codebook = self.config.stc.get_tensor(
+                self.key_pred + ".weight", self.device, optional = False, allow_bf16 = True)
         self.succ_codebook = self.config.stc.get_tensor(
-            self.key_succ, self.device, optional = False, allow_bf16 = True)
+            self.key_succ, self.device, optional = True, allow_bf16 = True)
+        if self.succ_codebook is None:
+            self.succ_codebook = self.config.stc.get_tensor(
+                self.key_succ + ".weight", self.device, optional = False, allow_bf16 = True)
         expected_shape = (self.vocab_size, self.rank)
         if self.pred_codebook.shape != expected_shape:
             raise ValueError(
@@ -342,7 +350,9 @@ class DFlash2Selector(Module):
         and the whole chain run as two kernels (no per-row host round trip, no torch
         intermediates)."""
         vocab_size = vocab_size or logits.shape[-1]
-        gate = self.hidden_proj.forward(hidden.half(), params = {})
+        # The generator passes state[:, 1:], a strided view for more than one row, and .half() on
+        # an fp16 state returns that view as is
+        gate = self.hidden_proj.forward(hidden.half().contiguous(), params = {})
         anchor_ids = anchor_ids.long()
         bsz, rows = logits.shape[:2]
         cuda = hidden.is_cuda and self.pred_codebook.dtype in (torch.half, torch.bfloat16)

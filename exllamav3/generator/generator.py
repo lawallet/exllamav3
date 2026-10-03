@@ -3,7 +3,7 @@ import logging
 import torch
 from ..model.model import Model
 from ..cache.cache import Cache
-from ..cache.recurrent import RecurrentCache
+from ..cache.recurrent import RecurrentCache, host_pool, mp_host_pool_release
 from ..tokenizer.tokenizer import Tokenizer
 from ..constants import PAGE_SIZE
 from ..util import cuda_sync_active
@@ -46,6 +46,7 @@ class Generator:
         dynamic_draft_tokens: bool = False,
         draft_confidence: float = 0.4,
         record_draft_stats: bool = False,
+        ngram_corpus: str | None = None,
         **kwargs
     ):
         """
@@ -86,6 +87,9 @@ class Generator:
 
         :param ngram_match_min:
             Minimum number of tokens to match for n-gram draft (0 = disabled).
+
+        :param ngram_corpus:
+            Optional frozen SAM file shared by n-gram jobs; requires ngram_match_min > 0.
 
         :param dynamic_draft_tokens:
             Adapt the per-round draft length to the workload. The draft is cut using a drafter-provided
@@ -165,11 +169,22 @@ class Generator:
                 self.num_draft_tokens = num_draft_tokens
             else:
                 self.num_draft_tokens = draft_model.caps.get("default_draft_size", 4)
+            depths = draft_model.caps.get("mtp_depths")
+            if depths is not None and self.num_draft_tokens > depths:
+                print(f" !! Warning: the MTP head has {depths} depth-specialized layers; draft positions past "
+                      f"{depths} reuse the last one, with decreasing acceptance (num_draft_tokens = "
+                      f"{self.num_draft_tokens})")
         elif ngram_match_min:
             self.num_draft_tokens = num_draft_tokens if num_draft_tokens is not None else 4
         else:
             self.num_draft_tokens = 0
 
+        self.ngram_corpus = None
+        if ngram_corpus is not None:
+            if ngram_match_min <= 0:
+                raise ValueError("ngram_corpus requires ngram_match_min > 0")
+            from .ngram import NgramCorpus
+            self.ngram_corpus = NgramCorpus(ngram_corpus, tokenizer)
         self.ngram_match_min = ngram_match_min
         self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
         self.record_draft_stats = record_draft_stats
@@ -238,7 +253,7 @@ class Generator:
         if recurrent_checkpoint_interval is None:
             recurrent_checkpoint_interval = model.caps.get("default_recurrent_checkpoint_interval", 2048)
 
-        assert recurrent_checkpoint_interval % PAGE_SIZE == 0 and recurrent_checkpoint_interval % PAGE_SIZE == 0, \
+        assert recurrent_checkpoint_interval % PAGE_SIZE == 0 and recurrent_checkpoint_interval_pp % PAGE_SIZE == 0, \
             "checkpoint interval must be a multiple of the page size (256)"
         def ceil_span(a, b):
             return (a + b - 1) // b * b
@@ -573,6 +588,11 @@ class Generator:
         """
         if self.recurrent_cache is not None:
             self.recurrent_cache.prune_stranded()
+            # The pruned checkpoints' buffers went back to the stash pool; drop them so the RAM
+            # is actually returned (the next stash reallocates once)
+            host_pool.release()
+            if self.model.loaded_tp:
+                self.model.tp_dispatch_all(mp_host_pool_release, ())
         self.pagetable.defrag()
         # Dynamic expert placement: apply any pending swap sweep now, between generations —
         # a placement change perturbs the logits slightly (same expert, different device
@@ -765,6 +785,7 @@ class Generator:
                 "block_table": block_index,
                 "cache": self.draft_cache,
                 "cache_seqlens": cache_seqlens,
+                "draft_step": idx,   # heads specialized per depth pick their head from this
             }
             if cal is not None:
                 params["export_draft_conf"] = True
@@ -1126,6 +1147,8 @@ class Generator:
                 launched.append((job, token_logits, sampled))
             if launched:
                 torch.cuda.synchronize(batch_logits.device)
+                # The sampled tokens are the next forward's inputs
+                self.model.prefetch_tokens([t for _, _, s in launched for t in s[0].view(-1).tolist()])
 
             for job, token_logits, (next_token, next_k_tokens, next_k_probs, next_prob) in launched:
                 eos, sampled_token, rq = job.receive_sample(
@@ -1231,8 +1254,11 @@ class Generator:
                             # Advance filters
                             for f in job.filters:
                                 if not f.is_active: continue
+                                # Both lists take one entry per active filter (prepare_logit_mask indexes them
+                                # in step)
                                 if f.use_background_worker():
                                     job.filter_futures.append(self.filter_pool.submit(f.get_next_logit_mask))
+                                    job.logit_masks.append(None)
                                 else:
                                     job.logit_masks.append(f.get_next_logit_mask())
                                     job.filter_futures.append(None)
@@ -1254,6 +1280,9 @@ class Generator:
                             draft_tokens.shape[-1],
                             accepted_length - 1,
                         ))
+
+                # The last sampled token leads the next forward
+                self.model.prefetch_tokens([sampled_token.item()])
 
                 accepted_lengths.append(accepted_length)
                 j += 1

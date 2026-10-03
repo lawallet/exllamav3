@@ -6,6 +6,7 @@ from torch.utils.cpp_extension import load
 import os
 import sys
 from .util.arch_list import maybe_set_arch_list_env
+from .util.cuda_flags import cuda_cflags
 
 extension_name = "exllamav3_ext"
 verbose = False  # Print wall of text when compiling
@@ -88,11 +89,11 @@ else:
     # compiler flags
 
     extra_cflags = []
-    extra_cuda_cflags = [
-        "-lineinfo", "-O3", "--use_fast_math",
-        "-Xcudafe", "--diag_suppress=177",
-        "-Xcudafe", "--diag_suppress=20012",
-    ]
+    extra_cuda_cflags = cuda_cflags(
+        cuda_home = torch.utils.cpp_extension.CUDA_HOME,
+        debug = ext_debug,
+        hip = bool(torch.version.hip),
+    )
 
     if windows:
         # TODO: preprocessor and lean_and_mean flags are needed for Windows cu132 build, verify that they don't break
@@ -112,8 +113,15 @@ else:
             extra_cflags += ["-ftime-report", "-DTORCH_USE_CUDA_DSA"]
             extra_cuda_cflags += []
 
+    # Windows: torch's JIT runs bare cl for the C++ sources and never passes -ccbin, so keep nvcc on the same cl.exe
     if not windows and (cuda_host_cxx := os.environ.get("CUDAHOSTCXX")):
         extra_cuda_cflags += ["-ccbin", cuda_host_cxx]
+    elif windows and os.environ.get("CUDAHOSTCXX"):
+        print(
+            " !! CUDAHOSTCXX is not used by the JIT build on Windows; "
+            "nvcc uses the same cl.exe as the C++ sources (see doc/env_vars.md)",
+            file = sys.stderr
+        )
 
     if torch.version.hip:
         extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
@@ -144,12 +152,23 @@ else:
     # Load extension
 
     maybe_set_arch_list_env()
-    exllamav3_ext = load(
-        name = extension_name,
-        sources = sources,
-        extra_include_paths = [sources_dir],
-        verbose = verbose,
-        extra_ldflags = extra_ldflags,
-        extra_cuda_cflags = extra_cuda_cflags,
-        extra_cflags = extra_cflags
-    )
+    try:
+        exllamav3_ext = load(
+            name = extension_name,
+            sources = sources,
+            extra_include_paths = [sources_dir],
+            verbose = verbose,
+            extra_ldflags = extra_ldflags,
+            extra_cuda_cflags = extra_cuda_cflags,
+            extra_cflags = extra_cflags
+        )
+    except IndexError as e:
+        # With no list given (or "native"), torch derives the architectures from the visible GPUs and
+        # fails with an IndexError when there are none
+        if torch.version.cuda and os.environ.get("TORCH_CUDA_ARCH_LIST", "") in ("", "native") and \
+                not torch.cuda.device_count():
+            raise RuntimeError(
+                f"No CUDA device is visible to determine the architectures to build {extension_name} for. "
+                "Set TORCH_CUDA_ARCH_LIST to the target architectures, e.g. TORCH_CUDA_ARCH_LIST=\"8.6;8.9+PTX\""
+            ) from e
+        raise

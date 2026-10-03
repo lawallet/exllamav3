@@ -126,13 +126,14 @@ at::Tensor BC_BlockPlan::begin(const at::Tensor& x) { return execute(0,x,{}); }
 at::Tensor BC_BlockPlan::middle(const at::Tensor& x,const at::Tensor& y) { return execute(1,x,y); }
 void BC_BlockPlan::finish(const at::Tensor& x,const at::Tensor& y) { execute(2,x,y); }
 void BC_BlockPlan::gr(Site& s,const at::Tensor& x,at::Tensor& y) {
-    gr_mix(x,s.w[0],s.w[1],s.w[2],s.eps,s.dots,s.post,s.mixed); y=s.mixed;
+    gr_mix(x,c10::nullopt,s.w[0],s.w[1],s.w[2],s.eps,s.dots,s.post,s.mixed); y=s.mixed;
 }
 void BC_BlockPlan::hc(Site& s,const at::Tensor& x,at::Tensor& y) {
     hc_mix(x,s.w[0],s.w[1],s.w[2],s.eps,s.hc_eps,s.iterations,s.dots,s.post,s.comb,s.mixed); y=s.mixed;
 }
 void BC_BlockPlan::apply(Site& s,const at::Tensor& x,at::Tensor& y) {
-    hc_apply(x,y,s.post,s.comb.defined() ? c10::optional<at::Tensor>(s.comb) : c10::nullopt);
+    hc_apply(x,y,s.post,s.comb.defined() ? c10::optional<at::Tensor>(s.comb) : c10::nullopt,
+             c10::nullopt,c10::nullopt);
 }
 void BC_BlockPlan::norm(Site& s,const at::Tensor&,at::Tensor& y) {
     rms_norm(s.mixed,s.w[3],s.normalized,s.eps,0.0f,1.0f,false,false,1); y=s.normalized;

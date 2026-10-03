@@ -31,13 +31,13 @@ def main():
         bp,sup,svp=ptr(matrices),ptr(su),ptr(sv)
         ns=torch.tensor(widths,dtype=torch.int32,device=dev)
         idx=torch.arange(len(widths),device=dev).unsqueeze(0)
-        for rows in (1,2,4,5,12,17):
+        for rows in (1,2,4,5,12,17,33,49,65):
             x=torch.randn((1,rows,k),device=dev,dtype=torch.half)*0.05
             had=torch.empty((len(widths),rows,k),device=dev,dtype=torch.half)
             for dtype in (torch.half,torch.float):
                 outputs=[torch.empty((rows,n),device=dev,dtype=dtype) for n in widths]
                 cp=ptr(outputs)
-                for shape in (1,2,3,4,-1):
+                for shape in (1,2,3,4,5,6,7,-1):
                     baseline=None
                     for fill in (0,1,-3,0):
                         for t in outputs: t.fill_(fill)
@@ -61,13 +61,13 @@ def main():
         bp=torch.tensor([matrices[0].data_ptr()+off*bits*2 for off in offsets],dtype=torch.long,device=dev)
         svp=torch.tensor([sv[0].data_ptr()+off*2 for off in offsets],dtype=torch.long,device=dev)
         sup=ptr(su[:1])
-        for rows in (1,5,17):
+        for rows in (1,5,17,33,49,65):
             x=torch.randn((1,rows,k),device=dev,dtype=torch.half)*0.05
             had=torch.empty((1,rows,k),device=dev,dtype=torch.half)
             output=torch.empty((rows,1024),device=dev,dtype=torch.half)
             carrier=torch.empty((1,rows,384),device=dev,dtype=torch.half)
             cp=torch.tensor([output.data_ptr()+off*2 for off in offsets],dtype=torch.long,device=dev)
-            for shape in (1,2,3,4,-1):
+            for shape in (1,2,3,4,5,6,7,-1):
                 baseline=None
                 for fill in (0,1,-3,0):
                     output.fill_(fill)

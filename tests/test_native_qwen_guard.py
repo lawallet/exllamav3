@@ -54,12 +54,16 @@ class TestGuard(unittest.TestCase):
         for key in ('fn_h', 'upx_h', 'w_h', 'rms_eps'):
             setattr(a, key, None)
             setattr(h, key, None)
+        for site in (a, h):
+            site.proj_h = torch.empty((8, 16), dtype=torch.half)
+            site.proj_m = 5
         for key in ('gate_tensor', 'gate_tensor_t', 'gate_sb', 'router_logits_bsz1',
                     'selected_experts_bsz1', 'routing_weights_bsz1'):
             setattr(m.routing_cfg, key, None)
 
     def get(self, params=None, x=None):
         with patch.object(n, 'ext', SimpleNamespace(BC_QwenBlock=lambda *args: self.sentinel,
+                          native_qwen_unfolded_gr=1,
                           native_qwen_mtp_max_q_len=getattr(self, 'max_rows', 0),
                           native_qwen_max_batch=getattr(self, 'max_batch', 0))), \
              patch.object(n, '_gate_t'):
@@ -92,6 +96,38 @@ class TestGuard(unittest.TestCase):
     def test_old_extension(self):
         with patch.object(n, 'ext', SimpleNamespace()):
             self.assertIsNone(n.get_native_block(self.block, Input(), {}))
+
+    def test_folded_projection_extension_fallback(self):
+        with patch.object(n, 'ext', SimpleNamespace(BC_QwenBlock=object())):
+            self.assertIsNone(n.get_native_block(self.block, Input(), {}))
+
+    def test_upstream_folded_expert_scale_fallback(self):
+        # 1.5.4 keeps the compensation in routing_cfg, not per_expert_scale.
+        self.block.mlp.interm_div = 2.0
+        self.assertIsNone(self.get())
+
+    def test_unfolded_projection_bundle(self):
+        with patch.object(n.native_plan, 'qwen', return_value=self.sentinel) as emit:
+            self.assertIs(self.get(), self.sentinel)
+        weights = emit.call_args.args[0]
+        for offset, site in ((0, self.block.attn_hc), (3, self.block.mlp_hc)):
+            self.assertEqual(weights[offset].shape[0], site.proj_m)
+            self.assertEqual(weights[offset].data_ptr(), site.proj_h.data_ptr())
+
+    def test_native_boundary_consumes_stock_weighted_copy(self):
+        from exllamav3.modules import transformer
+        x = torch.zeros((1, 1, 4, 8))
+        params = {'gr_weighted': (self.block.attn_hc, x.data_ptr(), x.clone())}
+        def begin(value):
+            self.assertNotIn('gr_weighted', params)
+            return value
+        native = SimpleNamespace(begin=begin, finish=lambda x, y: x.add_(1))
+        block = SimpleNamespace(attn=SimpleNamespace(forward=lambda y, p: y), out_dtype=None)
+        with patch.object(transformer, '_native_qwen_enabled', True), \
+             patch.object(n, 'get_native_block', return_value=native):
+            result = transformer.TransformerBlock.forward(block, x, params)
+        self.assertTrue(torch.equal(result, torch.ones_like(x)))
+        self.assertNotIn('gr_weighted', params)
 
 
 class TestMTPGuard(TestGuard):

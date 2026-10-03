@@ -87,6 +87,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         .def(py::init<std::vector<uintptr_t>, size_t, size_t, uintptr_t, size_t, bool, bool, bool, int>());
     m.def("stloader_deferred_cpu", &stloader_deferred_cpu, py::arg("jobs"));
     m.def("stloader_deferred_cuda", &stloader_deferred_cuda, py::arg("jobs"), py::arg("max_chunk_size"));
+    m.def("stloader_deferred_batch", &stloader_deferred_batch, py::arg("file_handles"), py::arg("loads"), py::arg("max_chunk_size"));
 
     m.def("cuda_host_register", &cuda_host_register, py::arg("ptr"), py::arg("nbytes"), py::arg("flags"));
     m.def("cuda_host_unregister", &cuda_host_unregister, py::arg("ptr"));
@@ -166,9 +167,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
     m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");
-    m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat");
+    m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat",
+          py::arg("shape_idx"), py::arg("size_m"), py::arg("size_k"), py::arg("size_n"), py::arg("bits"), py::arg("half_k") = false);
     m.def("g_get_cc", &g_get_cc, "g_get_cc");
     m.def("g_get_num_sms", &g_get_num_sms, "g_get_num_sms");
+    m.def("g_get_smem_max", &g_get_smem_max, "g_get_smem_max");
     m.def("exl3_gemv_int8_max_k", &exl3_gemv_int8_max_k, "exl3_gemv_int8_max_k");
     m.def("exl3_moe_cpu_make_layer", &exl3_moe_cpu_make_layer, "exl3_moe_cpu_make_layer");
     m.def("exl3_moe_cpu_free_layer", &exl3_moe_cpu_free_layer, "exl3_moe_cpu_free_layer");
@@ -320,6 +323,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         .def("finish", &BC_QwenBlock::finish);
     m.attr("native_qwen_mtp_max_q_len") = 5;
     m.attr("native_qwen_max_batch") = 4;
+    m.attr("native_qwen_unfolded_gr") = 1;
     #include "libtorch/dsv4_compressor_bc.h"
     #include "libtorch/dsv4_attn_bc.h"
     #include "sam_bc.h"

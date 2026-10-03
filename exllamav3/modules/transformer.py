@@ -170,6 +170,9 @@ class TransformerBlock(Module):
             from .native_qwen import get_native_block
             native = get_native_block(self, x, params)
             if native is not None:
+                # Native mixes weight streams inside the kernel. Consume the
+                # stock predecessor's copy before mutating the same residual.
+                params.pop('gr_weighted', None)
                 y = native.begin(x)
                 y = self.attn.forward(y, params)
                 native.finish(x, y)

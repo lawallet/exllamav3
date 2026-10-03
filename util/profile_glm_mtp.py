@@ -65,7 +65,7 @@ def main():
     from exllamav3 import Config, Model, Cache, Tokenizer, Generator, GreedySampler
     from exllamav3.modules import transformer
     from exllamav3.version import __version__
-    assert os.environ.get('CUDA_VISIBLE_DEVICES') == '2,0'
+    assert os.environ.get('CUDA_VISIBLE_DEVICES') in ('2,0', '2,0,1')
     transformer._native_glm_enabled = False
     a.output.mkdir(parents=True, exist_ok=False)
     def save(name, obj):
