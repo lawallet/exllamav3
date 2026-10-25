@@ -305,7 +305,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
              std::shared_ptr<BC_BlockSparseMLP>, int64_t, int64_t>())
         .def("begin", &BC_BlockPlan::begin)
         .def("middle", &BC_BlockPlan::middle)
-        .def("finish", &BC_BlockPlan::finish);
+        .def("finish", &BC_BlockPlan::finish)
+        .def("set_graphs", &BC_BlockPlan::set_graphs)
+        .def_readonly("graph_captures", &BC_BlockPlan::graph_captures)
+        .def_readonly("graph_replays", &BC_BlockPlan::graph_replays);
     py::class_<BC_GlmBlock>(m, "BC_GlmBlock")
         .def(py::init<std::vector<at::Tensor>, double, double, int64_t, int64_t, int64_t>(),
              py::arg("weights"), py::arg("norm_eps"), py::arg("hc_eps"), py::arg("iterations"), py::arg("rows") = 1, py::arg("batch") = 1)

@@ -1,5 +1,6 @@
 #pragma once
 #include "blocksparse_mlp.h"
+#include "../graph.cuh"
 #include <array>
 
 // Row-local orchestration only. Python owns all persistent attention state.
@@ -18,12 +19,28 @@ struct BC_BlockPlan {
     std::vector<at::Tensor> router;
     std::shared_ptr<BC_BlockSparseMLP> moe;
     int64_t batch, query, rows, channels, hidden;
+    struct GraphBinding {
+        at::Tensor tensor;
+        void* pointer;
+        std::vector<int64_t> sizes, strides;
+        at::ScalarType dtype;
+        at::Device device;
+    };
+    std::vector<GraphBinding> graph_bindings;
+    // Begin has no dynamic boundary; middle specializes its boundary dtype.
+    std::array<std::unique_ptr<Graph>, 3> stage_graphs;
+    std::array<bool, 2> graph_eligible = {false, false};
+    bool graphs_enabled = false;
+    uint64_t graph_captures = 0, graph_replays = 0;
     BC_BlockPlan(std::vector<std::vector<at::Tensor>> weights,
         std::vector<int64_t> kinds, std::vector<double> eps,
         std::vector<double> hc_eps, std::vector<int64_t> iterations,
         std::vector<std::vector<std::pair<int64_t,int64_t>>> code,
         std::vector<at::Tensor> router, std::shared_ptr<BC_BlockSparseMLP> moe,
         int64_t batch, int64_t query);
+    ~BC_BlockPlan();
+    void set_graphs(bool enabled);
+    void execute_graph(size_t stage, const at::Tensor& residual, at::Tensor y);
     at::Tensor begin(const at::Tensor& x);
     at::Tensor middle(const at::Tensor& x, const at::Tensor& y);
     void finish(const at::Tensor& x, const at::Tensor& y);
