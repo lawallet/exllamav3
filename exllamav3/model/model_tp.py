@@ -347,6 +347,18 @@ class Model_TPMixin:
         return r
 
 
+    def native_plan_tp_diagnostics(self):
+        """Synchronize ranks and report executed native plans, ops and fallbacks.
+
+        This explicit diagnostic RPC is outside the inference hot path.
+        Counts describe completed stage calls, not merely configuration flags.
+        """
+        if not self.loaded_tp:
+            raise RuntimeError('Native TP diagnostics require a loaded TP model')
+        from ..modules.native_tp import diagnostics
+        return self.tp_worker_dispatch_wait_multi(self.active_devices, diagnostics, ())
+
+
     def tp_dispatch_lm_head_argmax(self, args, return_max: bool = False):
         """
         Compute argmax over a tensor-parallel sharded LM head.
@@ -460,6 +472,13 @@ class Model_TPMixin:
     ):
         assert use_per_device is None or reserve_per_device is None
         if dev_limits is None: dev_limits = {}
+        from ..modules import native_plan
+        if native_plan.enabled:
+            from ..modules.native_tp import export_kind
+            if not any(export_kind(m) is not None for m in modules):
+                import warnings
+                warnings.warn('Native IR TP: no eligible native TP registrations for this model; '
+                              'using conventional upstream TP.', RuntimeWarning)
 
         # Set output device
         if tp_output_device is None:

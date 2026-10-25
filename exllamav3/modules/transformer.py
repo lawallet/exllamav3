@@ -13,6 +13,7 @@ _native_qwen_enabled = os.environ.get('EXL3_NATIVE_QWEN_BLOCK', '0') == '1'
 _native_glm_enabled = os.environ.get('EXL3_NATIVE_GLM_BLOCK', '0') == '1'
 
 class TransformerBlock(Module):
+    _native_tp_kind = None
 
     def __init__(
         self,
@@ -48,6 +49,7 @@ class TransformerBlock(Module):
         self.qbits_key = qbits_key
         self.out_dtype = out_dtype
         self._native_plan_get = None
+        self._native_tp_kind = None
 
         self.key_layer_scalar = key_layer_scalar
         self.key_attn_resid_scalar = key_attn_resid_scalar
@@ -87,6 +89,9 @@ class TransformerBlock(Module):
         return [a, m]
 
     def load(self, device: torch.device, **kwargs):
+        if self._native_tp_kind is not None:
+            from .native_tp import clear
+            clear(self)
         self._native_laguna = {}
         self._native_devstral = {}
         self._native_gemma = {}
@@ -125,6 +130,9 @@ class TransformerBlock(Module):
             )
 
     def unload(self):
+        if self._native_tp_kind is not None:
+            from .native_tp import clear
+            clear(self)
         self._native_laguna = {}
         self._native_devstral = {}
         self._native_gemma = {}
@@ -166,7 +174,7 @@ class TransformerBlock(Module):
     ) -> torch.Tensor:
         # Opt-in boundary around the existing attention/GDN call. Its recurrent,
         # QSA and paged-KV preparation remains authoritative on both paths.
-        if _native_qwen_enabled:
+        if _native_qwen_enabled and getattr(self, '_native_tp_kind', None) is None:
             from .native_qwen import get_native_block
             native = get_native_block(self, x, params)
             if native is not None:
@@ -178,7 +186,7 @@ class TransformerBlock(Module):
                 native.finish(x, y)
                 return to2(x, out_dtype, self.out_dtype)
 
-        if _native_glm_enabled:
+        if _native_glm_enabled and getattr(self, '_native_tp_kind', None) is None:
             from .native_glm import get_native_block
             native = get_native_block(self, x, params)
             if native is not None:
@@ -193,12 +201,17 @@ class TransformerBlock(Module):
         if native_plan.enabled and self._native_plan_get is not None:
             native = self._native_plan_get(self, x, params)
             if native is not None:
+                if self._native_tp_kind == 'qwen':
+                    params.pop('gr_weighted', None)
                 y = self.attn.forward(native.begin(x), params)
                 y = native.middle(x, y)
                 if x.ndim == 3:
                     params['residual'] = x
                 y = self.mlp.forward(y, params)
                 native.finish(x, y)
+                if self._native_tp_kind is not None:
+                    from .native_tp import record_execution
+                    record_execution(self)
                 if export_state:
                     s = params.get("export_states")
                     if not s:
@@ -288,6 +301,7 @@ class TransformerBlock(Module):
 
     def tp_export(self, plan, producer):
         assert self.device is not None, "Cannot export module for TP before loading."
+        from .native_tp import export_kind
 
         def _export(child):
             nonlocal producer
@@ -295,6 +309,7 @@ class TransformerBlock(Module):
 
         return {
             "cls": TransformerBlock,
+            "native_plan_kind": export_kind(self),
             "kwargs": {
                 "key": self.key,
                 "layer_idx": self.layer_idx,
@@ -348,6 +363,8 @@ class TransformerBlock(Module):
         module.attn_resid_scalar = consumer.recv(exported.get("attn_resid_scalar"), cuda = True)
         module.mlp_resid_scalar = consumer.recv(exported.get("mlp_resid_scalar"), cuda = True)
         module.device = device
+        from .native_tp import bind
+        bind(module, exported.get('native_plan_kind'), local_context)
         return module
 
 
