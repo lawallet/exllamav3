@@ -1,0 +1,125 @@
+{
+  "date": "2026-10-25",
+  "wheel": "exllamav3-1.5.4+nativeplan.v2.tp2-1finalir.ea9b615-cp313-cp313-win_amd64.whl",
+  "source_commit": "ea9b615c479feb2d459a054a25a648940dca6b8f",
+  "wheel_sha256": "b0e8da42daae4b2ad129161b8364ceab281f9a59ee7b340d65d56736ad6e253b",
+  "extension_sha256": "8df707acd5151ea4d6d69d8b6bafa8cd6c9c8b3e38021f0895293a575b733ab9",
+  "installed_in": "D:\\tabbyAPI\\venv",
+  "dependencies_unchanged": true,
+  "configuration_and_auth_unchanged": true,
+  "test_servers_stopped": true,
+  "original_config_model": "Qwen3.8-Flash-Next-Uncensored-exl3-4bpw",
+  "raw_results_sha256": "0d8d0848ec04e352a4031c0f4534fdd26a4f506493d0abdfd372874941670c08",
+  "raw_results": "native-results/tabby-wheel-ea9b615/api-results.json",
+  "rollback_wheel": "D:\\exllamav3\\native-results\\tp-cold-start\\package\\wheels\\exllamav3-1.5.4+nativeplan.v2.tp2-cp313-cp313-win_amd64.whl",
+  "checks": [
+    {
+      "name": "qwen-default",
+      "model": "Qwen3.8-Flash-Next-Uncensored-exl3-4bpw",
+      "visible_devices": "2,0,1",
+      "tp": false,
+      "mtp": false,
+      "native_enabled": false,
+      "max_context": 65536,
+      "cache_tokens": 65536,
+      "draft_cache_tokens": null,
+      "max_batch_size": 4,
+      "startup_seconds": 33.68616519996431,
+      "warmups": [],
+      "completion": true,
+      "repeated_completion_exact": true,
+      "chat": true,
+      "streaming_completion": true,
+      "streaming_chat": true,
+      "concurrent_requests": 4,
+      "cancellation_recovery": true,
+      "long_usage": {
+        "prompt_tokens": 17,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "prompt_time": 0.09,
+        "prompt_tokens_per_sec": 188.89,
+        "completion_tokens": 1024,
+        "completion_tokens_details": {
+          "accepted_prediction_tokens": 0,
+          "rejected_prediction_tokens": 0
+        },
+        "completion_time": 22.61,
+        "completion_tokens_per_sec": 45.28,
+        "total_tokens": 1041,
+        "total_time": 22.71
+      },
+      "long_wall_seconds": 22.713872199994512,
+      "graph_replays_after_long": [],
+      "graph_replays_after_reload": [],
+      "http_unload_reload": true,
+      "authenticated": true,
+      "clean_shutdown": true,
+      "intentional_disconnect_transport_log": "RuntimeError: Cannot call write() when UVStream is closing"
+    },
+    {
+      "name": "glm-tp2-mtp-cold",
+      "model": "GLM-5.3-Flash-Uncensored-EXL3-3.05bpw",
+      "visible_devices": "2,0",
+      "tp": true,
+      "mtp": true,
+      "native_enabled": true,
+      "max_context": 65536,
+      "cache_tokens": 65536,
+      "draft_cache_tokens": 65536,
+      "max_batch_size": 4,
+      "startup_seconds": 441.01379100000486,
+      "warmups": [
+        "18/18 passes in 317.59 s",
+        "18/18 passes in 5.42 s"
+      ],
+      "completion": true,
+      "repeated_completion_exact": true,
+      "chat": true,
+      "streaming_completion": true,
+      "streaming_chat": true,
+      "concurrent_requests": 4,
+      "cancellation_recovery": true,
+      "long_usage": {
+        "prompt_tokens": 17,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "prompt_time": 25.32,
+        "prompt_tokens_per_sec": 0.67,
+        "completion_tokens": 8192,
+        "completion_tokens_details": {
+          "accepted_prediction_tokens": 5535,
+          "rejected_prediction_tokens": 2436
+        },
+        "completion_time": 92.9,
+        "completion_tokens_per_sec": 88.18,
+        "total_tokens": 8209,
+        "total_time": 118.27
+      },
+      "long_wall_seconds": 118.38150030001998,
+      "graph_replays_after_long": [
+        261720,
+        261720
+      ],
+      "graph_replays_after_reload": [
+        3960,
+        3960
+      ],
+      "http_unload_reload": true,
+      "authenticated": true,
+      "clean_shutdown": true,
+      "intentional_disconnect_transport_log": "RuntimeError: Cannot call write() when UVStream is closing"
+    }
+  ],
+  "harness_correction": "First run failed during reload because redirected Windows cp1252 output could not encode a table character. The test launcher was changed to UTF-8 and the full campaign rerun successfully; no wheel or Tabby source change. The first run is preserved in native-results/tabby-wheel-ea9b615/first-encoding-run.json.",
+  "limitations": "Validates normal Qwen single-GPU non-MTP and GLM TP2 MTP through TabbyAPI, not every model/configuration. Long-request timing includes first-use compilation and is not a matched performance comparison. GLM native graphs require EXL3_NATIVE_PLAN=1; launch files were preserved.",
+  "disconnect_control": {
+    "extension_sha256": "702c0d54d5285bf7c9b2b408f3754332237ff6b3ab0da8a058290ce150b2e875",
+    "same_transport_error_reproduced": true,
+    "recovery_passed": true,
+    "exitcode": 0,
+    "installed_package_changed": false
+  }
+}

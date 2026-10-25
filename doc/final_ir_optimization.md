@@ -3,7 +3,9 @@
 The retained optimization is GLM-only HC stage graphs. The clean build improves
 matched 8192-token GLM TP2 MTP decode from 82.79 to 90.02 tok/s (+8.73%), with
 exact completions and acceptance. All 196 regression tests and final isolated
-cold-start/restart checks passed. No installed package has been changed.
+cold-start/restart checks passed. The initial campaign left installed packages
+unchanged; subsequent user-authorized TabbyAPI installation and HTTP validation
+are recorded at the end of this report.
 DeepSeek graph activation was rejected
 because long MTP requests also fail repeatability with the unchanged old binary.
 The versioned evidence index is [final_ir_measurements.json](final_ir_measurements.json);
@@ -17,7 +19,8 @@ Started 2026-10-25 from `68e4c7954a74ebea0df14e5bb7cce42619d406c5` on
 `feature/native-ir-final-optimization`, in
 `D:/exllamav3/native-results/final-ir-worktree`. Original commits, the unstaged
 `convert.py` change, untracked prompts and investigation files are untouched.
-No upstream merge, dependency upgrade, package installation, push or merge.
+No upstream merge, dependency upgrade, push or merge. Package installation was
+excluded from the initial campaign and authorized separately afterward.
 No applicable AGENTS.md was found.
 
 Python is 3.13.12, Torch 2.9.0+cu128, CUDA runtime 12.8, and Tabby's Triton is
@@ -388,7 +391,7 @@ plans directly. It no longer installs a global emitter closure or changes the
 single-device DeepSeek draft. Production diagnostics expose graph capture and
 replay counts outside timed execution. A clean full build compiles all 194
 translation units for sm89 and sm120 into an isolated output directory; no
-package is installed.
+package was installed during that build/benchmark campaign.
 
 The final host-timer comparison starts after 4096 outputs and observes the same
 21 target verifications and 63 draft forwards in each mode. Output-rank
@@ -482,7 +485,8 @@ validator's thresholds were not changed. Local graph arithmetic is exact using
 the same reduced inputs, and every four-step run reports 360 replays per rank.
 
 The feature requires the new extension to gain graph replay. Keeping an old
-extension preserves eager behavior. No installed package has been replaced.
+extension preserves eager behavior. Installed packages were preserved throughout
+the initial optimization campaign.
 First use captures graphs once for each encountered plan shape/dtype; steady
 requests replay them. This adds a small initialization and memory cost. Plan
 selection checks, unsupported-mode fallback, speculative decoding and collective
@@ -555,3 +559,49 @@ matched long results support retaining its graph path independently.
    fusion, shape expansion and TP protocol redesign are not justified by the
    current evidence. A dedicated upstream TP/Windows scheduling investigation
    is more promising than speculative additions to the IR instruction set.
+
+## Subsequent installed-wheel TabbyAPI validation
+
+On 2026-10-25, the user separately authorized building the wheel and testing it
+in TabbyAPI. The wheel built from `ea9b615` is
+`exllamav3-1.5.4+nativeplan.v2.tp2-1finalir.ea9b615-cp313-cp313-win_amd64.whl`,
+SHA256 `b0e8da42daae4b2ad129161b8364ceab281f9a59ee7b340d65d56736ad6e253b`.
+It contains sm89/sm120 kernels built with CUDA 12.8 and Torch 2.9.0+cu128.
+All 196 tests, with zero failures or skips, and the worker-signal regression
+passed against its isolated extraction before installation. The wheel's Python
+source and 316 native source-file hashes match the validated branch.
+
+The wheel was installed into `D:/tabbyAPI/venv` using `--no-index --no-deps
+--force-reinstall`. The prior installation was backed up and its rollback wheel
+verified. All dependency versions, `config.yml`, authentication, `start.bat`
+and `start_options.json` remain unchanged. Tests launched the real TabbyAPI
+server on an authenticated localhost-only port with separate test configs;
+temporary diagnostic routes verified installed import paths and graph counters.
+
+| Configuration | HTTP validation |
+| --- | --- |
+| Normal Qwen3.8, single GPU, MTP disabled, 65536-token cache, batch limit 4 | Completion/chat, both streaming endpoints, identical repeated completion, four concurrent requests, cancellation recovery, 1024 outputs, unload/reload and generation passed |
+| GLM TP2 + MTP, native IR and graphs enabled, target/draft caches 65536, batch limit 4 | Same API checks, plus 8192 outputs and confirmed graph replay on both ranks, passed |
+
+GLM started from an empty isolated Triton cache: all 18 rank warmup passes
+completed in 317.59 seconds (441.01 seconds to HTTP readiness). Reload completed
+the same 18 passes in 5.42 seconds. Its long HTTP response contained 8192 tokens,
+5535 accepted drafts and 2436 rejected drafts. Tabby reported 88.18 decode tok/s;
+wall time was 118.38 seconds including first-use compilation/prefill. This is a
+readiness test, not a matched performance comparison. Both ranks reported
+261720 cumulative graph replays after the long request and 3960 after reload.
+
+Deliberately disconnecting a stream logs Winloop's `Cannot call write() when
+UVStream is closing` exception. The request is cancelled, the generator remains
+healthy, and subsequent requests succeed. A separate control using the unchanged
+old wheel reproduced the same transport exception and successful recovery. This
+existing server-stack issue was recorded, not suppressed or patched in the wheel.
+An earlier redirected-log encoding failure was corrected by setting UTF-8 in
+the temporary test launcher, then rerunning the complete campaign successfully.
+
+The validated wheel remains installed; all test servers are stopped. GLM native
+graphs require `EXL3_NATIVE_PLAN=1` at startup. The normal launch files were
+preserved, so installation alone does not turn that flag on. Other models and
+TP configurations were not rerun through TabbyAPI in this subsequent campaign.
+See [the compact validation record](final_ir_tabby_validation.json); full local
+responses, logs and backup are in `native-results/tabby-wheel-ea9b615`.
