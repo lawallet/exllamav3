@@ -145,14 +145,6 @@ class Generator:
         cfg = self.model.config
         self.padded_vocab_size = ((cfg.vocab_size + 31) // 32) * 32
 
-        # Paging
-        self.pagetable = PageTable(self, cache)
-        # A cache has exactly one owning generator. Record the takeover and refuse to iterate a superseded generator
-        cache.owner_serial = getattr(cache, "owner_serial", 0) + 1
-        self.cache_owner_serial = cache.owner_serial
-        self.max_total_tokens = PAGE_SIZE * self.pagetable.max_pages
-        self._cache_stats_memo = (None, None)
-
         # Draft model
         self.draft_model = draft_model
         self.draft_cache = draft_cache
@@ -189,6 +181,19 @@ class Generator:
         self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
         self.record_draft_stats = record_draft_stats
         max_q_size = max(self.num_draft_tokens + 1, max_q_size)
+
+        # TP collectives have finite deadlines. Pay cold compiler/autotuner costs
+        # without collectives before PageTable claims the cache for generation.
+        if model.loaded_tp:
+            model.warmup_tp_for_generator(cache, max_chunk_size, max_batch_size, max_q_size)
+
+        # Paging
+        self.pagetable = PageTable(self, cache)
+        # A cache has exactly one owning generator. Record the takeover and refuse to iterate a superseded generator
+        cache.owner_serial = getattr(cache, "owner_serial", 0) + 1
+        self.cache_owner_serial = cache.owner_serial
+        self.max_total_tokens = PAGE_SIZE * self.pagetable.max_pages
+        self._cache_stats_memo = (None, None)
 
         # Chunking/partitioning
         self.max_batch_size = max_batch_size

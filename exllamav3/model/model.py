@@ -225,9 +225,9 @@ class Model(Model_TPMixin, Model_LSMixin):
           - one long-context family, when the cache is large enough: a chunk of prefill followed by a short
             step and a decode step past it, so sparse-attention regimes (DSA/QSA selection) compile too
 
-        In tensor-parallel mode every rank runs the passes on its own with the collectives stubbed out, so ranks
-        compile concurrently and a rank that is cold-compiling can never hold the others in a reduce past its
-        sync deadline. The values computed by warmup passes are meaningless.
+        In tensor-parallel mode every rank runs the passes on its own with the collectives stubbed out. Ranks
+        compile serially to avoid Windows compiler-cache races, with a separate compilation wait budget. A
+        cold-compiling rank cannot hold another rank in a reduce. Computed warmup values are meaningless.
 
         Call this once after load() and BEFORE attaching a Generator to the cache (or pass a cache the generator
         does not use): the passes write into the cache's leading pages and temporarily take recurrent-state
@@ -359,6 +359,10 @@ class Model(Model_TPMixin, Model_LSMixin):
                 if states:
                     for r in states:
                         cache.release_state(r)
+                if failures and self.loaded_tp:
+                    # In particular, do not queue more RPCs behind a failed or
+                    # timed-out compilation and mistake its reply for a later one.
+                    break
         if verbose:
             print(f" -- Warmup: {n_passes - len(failures)}/{n_passes} passes in {time.time() - t0:.2f} s")
         return failures

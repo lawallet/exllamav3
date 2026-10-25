@@ -1,5 +1,9 @@
 # Native IR with existing tensor parallelism
 
+The `tp2` follow-up adds automatic cold-start warmup for TP generators. The
+original `tp1` throughput tables below measure warmed execution; they did not
+establish that a first request with an empty compiler cache would succeed.
+
 ## Workspace and runtime provenance
 
 Development starts from `native-plan-v1.5.4-glm-regression`, commit
@@ -357,7 +361,7 @@ decode on physical GPU 2; a later 1000-token campaign reported 46.76. The fresh
 71.79-token/s baseline here confirms that the existing fast single-GPU path is
 still active. Historical workloads are not substituted for the matched table.
 
-## Compiled release
+## Initial compiled release (tp1)
 
 The user-requested wheel is
 `exllamav3-1.5.4+nativeplan.v2.tp1-cp313-cp313-win_amd64.whl`, built with

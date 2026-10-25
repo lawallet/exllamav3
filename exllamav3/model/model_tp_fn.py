@@ -286,6 +286,10 @@ def mp_model_forward(
             return None
 
     backend.end_cpu_reduce_jobs()
+    if warmup:
+        # Warmup acknowledgments mean kernels and copies have actually finished.
+        # No real collectives run here, so this cannot wait on another rank.
+        torch.cuda.synchronize(local_context["device"])
     return x
 
 

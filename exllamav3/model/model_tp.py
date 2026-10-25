@@ -17,6 +17,7 @@ from ..tokenizer.mm_embedding import send_embeddings
 
 cleanupper = Cleanupper()
 DISPATCH_TIMEOUT = 20
+WARMUP_TIMEOUT = 600
 
 class Model_TPMixin:
 
@@ -52,6 +53,7 @@ class Model_TPMixin:
         fan-out dispatch reaches spawned workers before invoking the blocking pseudo-worker path.
         """
         log_tp(None, "Creating TP context")
+        self.tp_warmup_token = object()
 
         # Must use spawn method to avoid CUDA errors. Docs say this should always be set by __main__ but seems
         # to work okay here
@@ -194,14 +196,14 @@ class Model_TPMixin:
         self.tp_pending_refs = None
 
 
-    def tp_worker_dispatch_single(self, device, fn, args):
+    def tp_worker_dispatch_single(self, device, fn, args, *, timeout = None):
         """
         Dispatch single function call to child and get return value
         """
         self.tp_drain_acks()
         conn = self.mp_parent_conn[device]
         conn.send((fn, args))
-        if conn.poll(DISPATCH_TIMEOUT):
+        if conn.poll(DISPATCH_TIMEOUT if timeout is None else timeout):
             result = conn.recv()
         else:
             raise TimeoutError("Timed out waiting for worker")
@@ -678,6 +680,8 @@ class Model_TPMixin:
         # Warmup passes run without collectives (see Model.warmup), so the CPU reduce helper
         # stays out of it: it would sit waiting for reduce jobs nobody pushes
         warmup = bool(params.get("tp_warmup"))
+        if warmup:
+            return self.forward_tp_warmup(x, params, last_kv_module_idx)
         if not warmup:
             self.tp_worker_dispatch(-1, mp_cpu_reduce, ())
 
@@ -706,6 +710,55 @@ class Model_TPMixin:
         self.tp_pending_refs = (args, params.get("recurrent_states"))
         self.restore_tp_params(params, reserve)
         return out
+
+
+    def forward_tp_warmup(self, x, params, last_kv_module_idx):
+        """Compile rank-local paths without starting collectives or the CPU reducer.
+
+        A cold compilation can exceed normal inference deadlines. Compile ranks
+        serially as well: identical GPUs can otherwise race over Triton's Windows
+        cache files. All replies are consumed before shared inputs are reused.
+        """
+        self.tp_drain_acks()
+        x, reserve = self.prepare_inputs_for_tp(x, params)
+        out = None
+        try:
+            for device in self.active_devices:
+                value = self.tp_worker_dispatch_single(
+                    device, mp_model_forward, (x, params, last_kv_module_idx, False, None),
+                    timeout = WARMUP_TIMEOUT,
+                )
+                if device == self.tp_output_device:
+                    out = value
+            return out
+        finally:
+            self.restore_tp_params(params, reserve)
+
+
+    def warmup_tp_for_generator(self, cache, max_chunk_size, max_batch_size, max_q_len):
+        """Warm a TP target before a generator claims its cache pages.
+
+        Frontends need not remember a separate warmup call. Recreating a generator
+        with the same cache and workload does not repeat it; reloading TP creates
+        a new token, invalidating the cached completion marker.
+        """
+        if not self.loaded_tp:
+            return
+        # Generator's non-recurrent default is 256, a scheduling capacity rather
+        # than a sensible synthetic warmup batch. Match Model.warmup's bounded
+        # default; recurrent caches further limit this to their actual slot count.
+        max_batch_size = min(max_batch_size, 8)
+        signature = (self.tp_warmup_token, max_chunk_size, max_batch_size, max_q_len)
+        if getattr(cache, "_tp_warmup_signature", None) == signature:
+            return
+        print(" -- Warming up TP kernels before generation (first compilation may take several minutes)", flush = True)
+        failures = self.warmup(
+            cache = cache, max_chunk_size = max_chunk_size, max_batch_size = max_batch_size,
+            max_q_len = max_q_len, long_context = True, verbose = True,
+        )
+        if failures:
+            raise RuntimeError(f"Tensor-parallel warmup failed; generation was not started: {failures}")
+        cache._tp_warmup_signature = signature
 
 
     def tp_rotate_cache_pages(self, cache_id: int, all_rotations: torch.Tensor):
