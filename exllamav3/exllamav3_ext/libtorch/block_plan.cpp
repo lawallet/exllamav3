@@ -43,9 +43,10 @@ BC_BlockPlan::BC_BlockPlan(std::vector<std::vector<at::Tensor>> weights,
             h=4; d=4096;
             TORCH_CHECK(w[0].scalar_type()==at::kHalf && w[0].sizes()==at::IntArrayRef({24,16384}) &&
                 w[1].scalar_type()==at::kFloat && w[1].numel()==24 &&
-                w[2].scalar_type()==at::kFloat && w[2].numel()==3 && w[3].numel()==d &&
-                (w[3].scalar_type()==at::kHalf || w[3].scalar_type()==at::kBFloat16 ||
-                 w[3].scalar_type()==at::kFloat), "Block plan: invalid HC weights");
+                w[2].scalar_type()==at::kFloat && w[2].numel()==3, "Block plan: invalid HC weights");
+            TORCH_CHECK(w[3].sizes()==at::IntArrayRef({d}) &&
+                (w[3].scalar_type()==at::kHalf || w[3].scalar_type()==at::kBFloat16),
+                "Block plan: invalid HC norm weight");
         }
         TORCH_CHECK(i==0 || (h==channels && d==hidden), "Block plan: inconsistent residual dimensions");
         channels=h; hidden=d;
@@ -135,7 +136,7 @@ BC_BlockPlan::~BC_BlockPlan() {
 
 void BC_BlockPlan::set_graphs(bool enabled) {
     // Reject unsupported direct-call norm operands before entering capture.
-    // Python's HC binding already checks these; eager plan behavior is unchanged.
+    // Construction validates these too, but callers can rebind tensor storage.
     if (enabled) for (size_t stage=0;stage<2;++stage) if (graph_eligible[stage]) {
         const auto& w=sites[stages[stage].back().site].w[3];
         TORCH_CHECK(w.dim()==1 && (w.scalar_type()==at::kHalf || w.scalar_type()==at::kBFloat16),
@@ -156,6 +157,12 @@ void BC_BlockPlan::execute_graph(size_t stage,const at::Tensor& residual,at::Ten
     auto& owned = stage_graphs[slot];
     if (!owned) owned = std::make_unique<Graph>();
     auto& graph = *owned;
+    // Graph callers own the eager fallback; GraphCapture/launch do not enforce
+    // the upstream EXL3_GRAPHS policy themselves.
+    if (graph.disabled) {
+        for (const auto& op:stages[stage]) (this->*op.kernel)(sites[op.site],residual,y);
+        return;
+    }
     if (!graph.ready) {
         GraphCapture capture(graph);
         for (const auto& op:stages[stage]) {
@@ -198,6 +205,15 @@ at::Tensor BC_BlockPlan::execute(size_t stage,const at::Tensor& x,at::Tensor y) 
         y=y.reshape({rows,hidden}).contiguous();
     }
     c10::cuda::CUDAGuard guard(x.device());
+    // Reject a rebound late-stage norm before APPLY can mutate the residual,
+    // including eager plans and the global graph-disabled path.
+    for (const auto& s:sites) if (s.normalized.defined()) {
+        const auto& w=s.w[3];
+        TORCH_CHECK(w.device()==x.device() && w.is_contiguous() &&
+            w.sizes()==at::IntArrayRef({hidden}) &&
+            (w.scalar_type()==at::kHalf || w.scalar_type()==at::kBFloat16),
+            "Block plan: invalid HC norm weight");
+    }
     auto residual=x.view({rows,channels,hidden});
     if (graphs_enabled && stage<2 && graph_eligible[stage]) execute_graph(stage,residual,y);
     else for (const auto& op:stages[stage]) (this->*op.kernel)(sites[op.site],residual,y);

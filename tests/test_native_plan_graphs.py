@@ -100,17 +100,65 @@ class TestPlanGraphs(unittest.TestCase):
             plan.middle(x, torch.zeros(1,4,4096,device=0))
         self.assertTrue(torch.equal(x,original))
 
-    def test_unsupported_norm_rejected_before_capture(self):
-        for invalid in ('dtype', 'shape'):
-            weights = self.weights(0)
-            weights[1][3] = (weights[1][3].float() if invalid == 'dtype'
-                             else weights[1][3].view(1,4096))
-            plan = self.plan(weights)
-            with self.assertRaisesRegex(RuntimeError, 'unsupported norm binding'):
-                plan.set_graphs(True)
-            self.assertEqual(plan.graph_captures, 0)
-        # The failures must not leave the thread in CUDA capture mode.
-        self.assertEqual(torch.ones(1,device=0).sum().item(), 1)
+    def test_unsupported_norm_rejected_at_construction(self):
+        for device in range(torch.cuda.device_count()):
+            for site in (0, 1):
+                for invalid in ('dtype', 'shape', 'layout'):
+                    weights = self.weights(device)
+                    w = weights[site][3]
+                    weights[site][3] = (w.float() if invalid == 'dtype' else
+                                       w.view(1,4096) if invalid == 'shape' else
+                                       torch.stack((w,w), dim=1)[:,0])
+                    for factory in (self.plan, self.glm_plan):
+                        with self.subTest(device=device, site=site, invalid=invalid, factory=factory.__name__):
+                            with self.assertRaises(RuntimeError):
+                                factory(weights)
+            self.assertEqual(torch.ones(1,device=device).sum().item(), 1)
+
+    def glm_plan(self, weights):
+        return ext.BC_GlmBlock(weights[0]+weights[1], 1e-5, 1e-6, 20, 4, 1)
+
+    def test_rebound_norm_rejects_before_residual_mutation(self):
+        for device in range(torch.cuda.device_count()):
+            for mode in ('eager', 'graphs', 'glm'):
+                for invalid in ('dtype', 'shape', 'layout'):
+                    with self.subTest(device=device, mode=mode, invalid=invalid):
+                        weights = self.weights(device)
+                        plan = self.glm_plan(weights) if mode == 'glm' else self.plan(weights)
+                        if mode == 'graphs':
+                            plan.set_graphs(True)
+                        x = torch.randn(1,4,4,4096,device=device)
+                        plan.begin(x)
+                        original = x.clone()
+                        w = weights[1][3]
+                        w.data = (w.float() if invalid == 'dtype' else
+                                  w.view(1,4096) if invalid == 'shape' else
+                                  torch.stack((w,w), dim=1)[:,0])
+                        for call in (lambda: plan.begin(x),
+                                     lambda: plan.middle(x, torch.zeros(1,4,4096,device=device)),
+                                     lambda: plan.finish(x, torch.zeros(1,4,4096,device=device))):
+                            with self.assertRaises(RuntimeError):
+                                call()
+                            self.assertTrue(torch.equal(x, original))
+
+    def test_supported_norm_dtypes_match_bespoke_and_graphs(self):
+        for device in range(torch.cuda.device_count()):
+            for dtype in (torch.float16, torch.bfloat16):
+                weights = self.weights(device)
+                for site in weights:
+                    site[3] = site[3].to(dtype)
+                plans = [self.glm_plan(weights), self.plan(weights), self.plan(weights)]
+                plans[-1].set_graphs(True)
+                x = torch.randn(1,4,4,4096,device=device)
+                residuals = [x.clone() for _ in plans]
+                outputs = [p.begin(r).clone() for p,r in zip(plans,residuals)]
+                self.assertTrue(all(torch.equal(outputs[0],o) for o in outputs[1:]))
+                y = torch.randn(1,4,4096,device=device)
+                outputs = [p.middle(r,y).clone() for p,r in zip(plans,residuals)]
+                self.assertTrue(all(torch.equal(outputs[0],o) for o in outputs[1:]))
+                for p,r in zip(plans,residuals):
+                    p.finish(r,y)
+                self.assertTrue(all(torch.equal(residuals[0],r) for r in residuals[1:]))
 
     def test_destroy_uses_original_device_after_binding_replacement(self):
         weights = self.weights(0)

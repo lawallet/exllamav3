@@ -38,6 +38,10 @@ def get_native_mtp_block(block, x, params):
         type(an) is not RMSNorm or type(mn) is not RMSNorm or
         any(v is not None for v in (block.attn_resid_scalar,block.mlp_resid_scalar,block.attn_post_norm,block.mlp_post_norm))):
         return None
+    if any(n.weight is None or tuple(n.weight.shape) != (4096,) or
+           n.weight.dtype not in (torch.float16, torch.bfloat16) or
+           n.weight.device != x.device or not n.weight.is_contiguous() for n in (an, mn)):
+        return None
     signature = (id(draft),) + tuple(id(t) for h,n in ((a,an),(m,mn)) for t in (h.fn,h.fn_h,h.base,h.scale,n.weight))
     signature += tuple(v for h,n in ((a,an),(m,mn)) for v in
         (h.hc_mult,h.hidden_size,h.sinkhorn_iters,h.hc_eps,h.rms_eps,
@@ -68,8 +72,7 @@ def get_native_mtp_block(block, x, params):
             any(t is None or t.device != x.device or not t.is_contiguous() for t in (h.fn,h.base,h.scale,n.weight))):
             return None
         if (tuple(h.fn.shape) != (24,16384) or h.base.numel() != 24 or h.scale.numel() != 3 or
-            n.weight.numel() != 4096 or h.base.dtype != torch.float32 or h.scale.dtype != torch.float32 or
-            n.weight.dtype not in (torch.float16,torch.bfloat16,torch.float32)):
+            h.base.dtype != torch.float32 or h.scale.dtype != torch.float32):
             return None
         if h.fn_h is None: h.fn_h=h.fn.half()
         weights.extend((h.fn_h,h.base,h.scale,n.weight))

@@ -46,6 +46,9 @@ class TestMTPGuard(unittest.TestCase):
             self.x.shape=(1,q,4,4096)
             self.assertIsNone(self.get(recurrent_history=True))
 
+    def test_norm_dtype_and_shape_checked_before_cached_plan(self):
+        TestGuard.test_norm_dtype_and_shape_checked_before_cached_plan(self)
+
     def test_wrong_attachment(self):
         self.draft.attached_model=lambda:None
         self.assertIsNone(self.get())

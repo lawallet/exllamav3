@@ -98,6 +98,19 @@ class TestDeepseek(unittest.TestCase):
         self.constructor.side_effect=RuntimeError('native contract')
         with self.assertRaisesRegex(RuntimeError,'native contract'): self.get()
 
+    def test_norm_dtypes_and_rebinding(self):
+        for dtype in (torch.float16, torch.bfloat16):
+            self.block.mlp_norm.weight = Tensor((4096,), self.x.device)
+            self.block.mlp_norm.weight.dtype = dtype
+            self.assertIsNotNone(self.get())
+        calls = self.constructor.call_count
+        self.block.mlp_norm.weight.dtype = torch.float32
+        self.assertIsNone(self.get())
+        self.block.mlp_norm.weight.dtype = torch.float16
+        self.block.mlp_norm.weight.shape = (1,4096)
+        self.assertIsNone(self.get())
+        self.assertEqual(self.constructor.call_count, calls)
+
     def test_registered_dispatch_keeps_exports_and_propagates_stage_errors(self):
         from exllamav3.modules import transformer, TransformerBlock
         b=TransformerBlock.__new__(TransformerBlock)

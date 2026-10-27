@@ -18,7 +18,7 @@ BC_GlmBlock::BC_GlmBlock(std::vector<at::Tensor> w, double ne, double he, int64_
         TORCH_CHECK(weights[i].scalar_type() == at::kHalf && weights[i].sizes() == at::IntArrayRef({24, 16384}), "GLM: fn shape/type");
         TORCH_CHECK(weights[i+1].scalar_type() == at::kFloat && weights[i+1].numel() == 24, "GLM: base shape/type");
         TORCH_CHECK(weights[i+2].scalar_type() == at::kFloat && weights[i+2].numel() == 3, "GLM: scale shape/type");
-        TORCH_CHECK(weights[i+3].numel() == 4096 && (weights[i+3].scalar_type() == at::kHalf || weights[i+3].scalar_type() == at::kBFloat16 || weights[i+3].scalar_type() == at::kFloat), "GLM: norm shape/type");
+        TORCH_CHECK(weights[i+3].sizes() == at::IntArrayRef({4096}) && (weights[i+3].scalar_type() == at::kHalf || weights[i+3].scalar_type() == at::kBFloat16), "GLM: norm shape/type");
     }
     auto opts = weights[1].options();
     partials = at::empty({rows, hc_mix_num_chunks(rows, 16384), 25}, opts);
@@ -32,6 +32,13 @@ BC_GlmBlock::BC_GlmBlock(std::vector<at::Tensor> w, double ne, double he, int64_
 void BC_GlmBlock::validate(const at::Tensor& x) {
     TORCH_CHECK(x.device() == weights[0].device() && x.scalar_type() == at::kFloat &&
                 x.is_contiguous() && x.sizes() == at::IntArrayRef({batch, q_len, 4, 4096}), "GLM: invalid residual");
+    for (int i : {3, 7}) {
+        const auto& w = weights[i];
+        TORCH_CHECK(w.device() == x.device() && w.is_contiguous() &&
+                    w.sizes() == at::IntArrayRef({4096}) &&
+                    (w.scalar_type() == at::kHalf || w.scalar_type() == at::kBFloat16),
+                    "GLM: norm shape/type");
+    }
 }
 
 at::Tensor BC_GlmBlock::mix_norm(const at::Tensor& x, int site) {

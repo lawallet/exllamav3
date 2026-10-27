@@ -18,6 +18,20 @@ class Owner:
     caps = {'supports_tp': True}
 
 
+class TestHCNormContract(unittest.TestCase):
+    def test_norm_dtypes_and_layout(self):
+        n = native_tp.RMSNorm.__new__(native_tp.RMSNorm)
+        n.groups, n.span_heads, n.unweighted = 1, False, False
+        n.rms_norm_eps, n.constant_bias, n.constant_scale = 1e-5, 0., 1.
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            n.weight = torch.ones(4096, dtype=dtype)
+            self.assertEqual(native_tp._norm(n,n.weight.device,4096), dtype != torch.float32)
+        n.weight = torch.ones(1,4096,dtype=torch.float16)
+        self.assertFalse(native_tp._norm(n,n.weight.device,4096))
+        n.weight = torch.ones(4096,2,dtype=torch.float16)[:,0]
+        self.assertFalse(native_tp._norm(n,n.weight.device,4096))
+
+
 class TestRegistration(unittest.TestCase):
     def test_requires_existing_registration_and_upstream_capability(self):
         owner = Owner()

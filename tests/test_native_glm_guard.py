@@ -83,6 +83,20 @@ class TestGuard(unittest.TestCase):
         self.block.attn_norm.constant_scale = 2
         self.assertIsNone(self.get())
 
+    def test_norm_dtype_and_shape_checked_before_cached_plan(self):
+        for dtype in (torch.float16, torch.bfloat16):
+            self.block.mlp_norm.weight = Tensor((4096,)).half()
+            self.block.mlp_norm.weight.dtype = dtype
+            self.assertIsNotNone(self.get())
+        calls = self.constructor.call_count
+        # Keep tensor identity unchanged, as with weight.data rebinding.
+        self.block.mlp_norm.weight.dtype = torch.float32
+        self.assertIsNone(self.get())
+        self.block.mlp_norm.weight.dtype = torch.float16
+        self.block.mlp_norm.weight.shape = (1,4096)
+        self.assertIsNone(self.get())
+        self.assertEqual(self.constructor.call_count, calls)
+
     def test_reload_rebuilds(self):
         self.get()
         self.block.attn_norm.weight = Tensor((4096,)).half()

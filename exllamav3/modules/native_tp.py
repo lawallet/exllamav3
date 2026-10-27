@@ -93,14 +93,13 @@ def _valid(t, device, shape, dtypes):
             tuple(t.shape) == shape and t.dtype in dtypes)
 
 
-def _norm(n, device, hidden, hc=False):
-    dtypes = (torch.float16, torch.bfloat16, torch.float32) if hc else (torch.float16, torch.bfloat16)
+def _norm(n, device, hidden):
     return (type(n) is RMSNorm and n.groups == 1 and not n.span_heads and
             not n.unweighted and math.isfinite(n.rms_norm_eps) and
             _FLOAT_TINY <= n.rms_norm_eps <= _FLOAT_MAX and
             abs(n.constant_bias) <= _FLOAT_MAX and
             abs(n.constant_scale) <= _FLOAT_MAX and
-            _valid(n.weight, device, (hidden,), dtypes))
+            _valid(n.weight, device, (hidden,), (torch.float16, torch.bfloat16)))
 
 
 def get_native_block(block, x, params):
@@ -259,7 +258,7 @@ def _streams(block, x, reject):
             return cached
         for h, n in sites:
             if (type(h) is not HyperConnection or h.hc_mult != 4 or h.hidden_size != 4096 or
-                    not _norm(n, x.device, 4096, hc=True) or n.constant_bias != 0 or n.constant_scale != 1 or
+                    not _norm(n, x.device, 4096) or n.constant_bias != 0 or n.constant_scale != 1 or
                     h.rms_eps != n.rms_norm_eps or not math.isfinite(h.hc_eps) or h.hc_eps <= 0 or
                     not isinstance(h.sinkhorn_iters, int) or h.sinkhorn_iters < 1 or
                     not _valid(h.fn, x.device, (24, 16384), (torch.float32,)) or

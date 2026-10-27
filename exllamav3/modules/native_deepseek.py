@@ -60,7 +60,7 @@ def get_native_block(block, x, params):
         if (h.fn.shape != (24, 16384) or h.fn.dtype != torch.float32 or
             h.base.shape != (24,) or h.base.dtype != torch.float32 or
             h.scale.shape != (3,) or h.scale.dtype != torch.float32 or
-            n.weight.shape != (4096,) or n.weight.dtype not in (torch.float16, torch.bfloat16, torch.float32)):
+            n.weight.shape != (4096,) or n.weight.dtype not in (torch.float16, torch.bfloat16)):
             return None
         if h.fn_h is not None and (h.fn_h.shape != h.fn.shape or h.fn_h.dtype != torch.float16 or
                                   h.fn_h.device != x.device or not h.fn_h.is_contiguous()):
