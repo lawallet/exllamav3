@@ -128,7 +128,7 @@ BC_BlockPlan::BC_BlockPlan(std::vector<std::vector<at::Tensor>> weights,
 
 BC_BlockPlan::~BC_BlockPlan() {
     // A plan can be released while a different rank-local device is current.
-    if (stage_graphs[0] || stage_graphs[1] || stage_graphs[2]) {
+    if (!graph_bindings.empty()) {
         c10::cuda::CUDAGuard guard(graph_bindings.front().device);
         for (auto& graph:stage_graphs) graph.reset();
     }
@@ -152,7 +152,8 @@ void BC_BlockPlan::execute_graph(size_t stage,const at::Tensor& residual,at::Ten
         TORCH_CHECK(b.tensor.device()==b.device && b.tensor.scalar_type()==b.dtype &&
             b.tensor.sizes()==at::IntArrayRef(b.sizes) && b.tensor.strides()==at::IntArrayRef(b.strides) &&
             b.tensor.data_ptr()==b.pointer, "Block plan graph: changed fixed binding");
-    const size_t slot = stage==0 ? 0 : (y.scalar_type()==at::kHalf ? 1 : 2);
+    const size_t slot = (stage==0 ? 0 : (y.scalar_type()==at::kHalf ? 1 : 2)) +
+        (hc_fusion_enabled ? 3 : 0);
     void* boundary = stage ? y.data_ptr() : nullptr;
     auto& owned = stage_graphs[slot];
     if (!owned) owned = std::make_unique<Graph>();
@@ -165,7 +166,15 @@ void BC_BlockPlan::execute_graph(size_t stage,const at::Tensor& residual,at::Ten
     }
     if (!graph.ready) {
         GraphCapture capture(graph);
-        for (const auto& op:stages[stage]) {
+        if (hc_fusion_enabled) {
+            auto& s=sites[stages[stage].back().site];
+            Site* prev=stage ? &sites[stages[stage].front().site] : nullptr;
+            hc_mix_fused_gr(residual, prev ? c10::optional<at::Tensor>(y) : c10::nullopt,
+                prev ? c10::optional<at::Tensor>(prev->post) : c10::nullopt,
+                prev ? c10::optional<at::Tensor>(prev->comb) : c10::nullopt,
+                s.w[0],s.w[1],s.w[2],s.eps,s.hc_eps,s.iterations,
+                s.dots,s.post,s.comb,s.mixed,s.w[3],s.normalized,s.eps,0.0,1.0,&graph);
+        } else for (const auto& op:stages[stage]) {
             auto& s=sites[op.site];
             if (op.kernel==&BC_BlockPlan::hc) {
                 hc_mix_gr(residual,s.w[0],s.w[1],s.w[2],s.eps,s.hc_eps,s.iterations,
@@ -180,16 +189,19 @@ void BC_BlockPlan::execute_graph(size_t stage,const at::Tensor& residual,at::Ten
         }
         capture.finish();
         ++graph_captures;
+        if (hc_fusion_enabled) ++fused_graph_captures;
     }
     std::vector<PPTR> args;
-    if (stage) {
+    if (stage && !hc_fusion_enabled) {
         args.emplace_back(GP_hc_streams,residual.data_ptr());
         args.emplace_back(GP_hc_boundary,boundary);
     }
     args.emplace_back(GP_hc_streams,residual.data_ptr());
+    if (stage && hc_fusion_enabled) args.emplace_back(GP_hc_boundary,boundary);
     args.emplace_back(GP_hc_streams,residual.data_ptr());
     graph.launch(args,at::cuda::getCurrentCUDAStream().stream());
     ++graph_replays;
+    if (hc_fusion_enabled) ++fused_graph_replays;
 }
 
 at::Tensor BC_BlockPlan::execute(size_t stage,const at::Tensor& x,at::Tensor y) {

@@ -927,6 +927,10 @@ static void hc_mix_launch
         // The pending apply runs inside the partials kernel when each stream is a whole number of
         // partials chunks (always at decode row counts); otherwise as its own launch first
         const bool fusable = pend && (D % chunk_cols) == 0 && n_chunks_a % H == 0;
+        // Graph patch lists below describe exactly two nodes. Reject a new shape
+        // before launching if it would require the separate-apply fallback.
+        if (graph) TORCH_CHECK(D == 4096 && R <= 12 && fn_half && nrm &&
+                              (!pend || fusable), "hc_mix: unsupported folded graph shape");
         if (pend && !fusable)
         {
             int chunks_p = std::min(32, std::max(1, 256 / R));
@@ -975,6 +979,19 @@ static void hc_mix_launch
         else
             hc_mix_finalize_kernel<4, 24, false, true><<<grid_c, NUM_THREADS, 0, stream>>>(ARGS_C(post_p, comb_p));
         cuda_check(cudaPeekAtLastError());
+        if (graph)
+        {
+            void* partial = pend
+                ? (pend->y_half ? (void*)hc_apply_partials_kernel<4,24,half,half>
+                                : (void*)hc_apply_partials_kernel<4,24,half,float>)
+                : (void*)hc_mix_partials_kernel<4,24,half>;
+            void* finalize = (void*)hc_mix_finalize_kernel<4,24,false,true,true>;
+            graph->record_param(partial, GP_hc_streams, 0);
+            if (pend) graph->record_param(partial, GP_hc_boundary, 1);
+            graph->record_param(partial, GP_end, 0);
+            graph->record_param(finalize, GP_hc_streams, 0);
+            graph->record_param(finalize, GP_end, 0);
+        }
         return;
     }
     if (!head)
@@ -1064,7 +1081,7 @@ void hc_mix
 // hc_mix with the launch-count folds (hc_fuse.cuh): y / post_a / comb_a describe a pending hc_apply
 // on these streams (all or none), run inside the partials kernel; norm_y receives the RMSNorm of the collapsed
 // output, run inside the finalize (norm_w may be none for an unweighted norm). collapsed is always written
-void hc_mix_fused
+void hc_mix_fused_gr
 (
     at::Tensor x,                        // (R, 4, D) float, updated in place by the pending apply
     const c10::optional<at::Tensor>& y,
@@ -1084,7 +1101,8 @@ void hc_mix_fused
     const c10::optional<at::Tensor>& norm_y,
     double norm_eps,
     double norm_bias,
-    double norm_scale
+    double norm_scale,
+    Graph* graph
 )
 {
     TORCH_CHECK_DTYPE(x, kFloat);
@@ -1129,7 +1147,19 @@ void hc_mix_fused
     }
 
     hc_mix_launch(x, fn, base, scale, (float) rms_eps, (float) hc_eps, (int) sinkhorn_iters,
-                  partials, &post, &comb, collapsed, nullptr, pend_p, nrm_p);
+                  partials, &post, &comb, collapsed, graph, pend_p, nrm_p);
+}
+
+void hc_mix_fused(at::Tensor x, const c10::optional<at::Tensor>& y,
+    const c10::optional<at::Tensor>& post_a, const c10::optional<at::Tensor>& comb_a,
+    const at::Tensor& fn, const at::Tensor& base, const at::Tensor& scale,
+    double rms_eps, double hc_eps, int64_t sinkhorn_iters, at::Tensor partials,
+    at::Tensor post, at::Tensor comb, at::Tensor collapsed,
+    const c10::optional<at::Tensor>& norm_w, const c10::optional<at::Tensor>& norm_y,
+    double norm_eps, double norm_bias, double norm_scale)
+{
+    hc_mix_fused_gr(x,y,post_a,comb_a,fn,base,scale,rms_eps,hc_eps,sinkhorn_iters,
+        partials,post,comb,collapsed,norm_w,norm_y,norm_eps,norm_bias,norm_scale,nullptr);
 }
 
 void hc_head

@@ -22,6 +22,7 @@ _OP_COUNTS = dict(qwen=4, glm=6, deepseek=6, gemma=4, devstral=3)
 # Resolved at import; only used when constructing an HC plan. Older extensions
 # continue to use eager stages, and operators can opt out before startup.
 hc_graphs_enabled = os.environ.get('EXL3_NATIVE_TP_GRAPHS', '1') == '1'
+hc_fusion_enabled = os.environ.get('EXL3_NATIVE_TP_HC_FUSION', '0') == '1'
 _hc_graphs_available = hasattr(getattr(native_plan.ext, 'BC_BlockPlan', object), 'set_graphs')
 
 
@@ -31,6 +32,8 @@ def _hc_plan(sites, batch, query, *, kind):
     # MTP repeatability issue prevents certifying that workload; keep it eager.
     if kind == 'glm' and hc_graphs_enabled and _hc_graphs_available:
         plan.set_graphs(True)
+        if hc_fusion_enabled and hasattr(plan, 'set_hc_fusion'):
+            plan.set_hc_fusion(True)
     return plan
 
 

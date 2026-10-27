@@ -26,6 +26,7 @@ class TestGraphPolicyProcess(unittest.TestCase):
             global_on = (os.environ.get('EXL3_GRAPHS') == '1' if torch.version.hip
                          else os.environ.get('EXL3_GRAPHS', '1') != '0')
             native_on = os.environ.get('EXL3_NATIVE_TP_GRAPHS', '1') == '1'
+            fusion_on = os.environ.get('EXL3_NATIVE_TP_HC_FUSION', '0') == '1'
             torch.manual_seed(819)
             for device in range(torch.cuda.device_count()):
                 for kind in ('direct', 'glm', 'deepseek'):
@@ -36,6 +37,8 @@ class TestGraphPolicyProcess(unittest.TestCase):
                     if kind == 'direct':
                         candidate = factory.plan(weights)
                         candidate.set_graphs(True)
+                        if hasattr(candidate, 'set_hc_fusion'):
+                            candidate.set_hc_fusion(fusion_on)
                     else:
                         candidate = native_tp._hc_plan(sites,1,4,kind=kind)
                     retained = []
@@ -52,15 +55,19 @@ class TestGraphPolicyProcess(unittest.TestCase):
                     expected = global_on and (kind == 'direct' or (kind == 'glm' and native_on))
                     assert candidate.graph_captures == (3 if expected else 0), (kind, candidate.graph_captures)
                     assert candidate.graph_replays == (4 if expected else 0), (kind, candidate.graph_replays)
+                    if hasattr(candidate, 'fused_graph_replays'):
+                        assert candidate.fused_graph_replays == (4 if expected and fusion_on else 0)
+                        assert candidate.fused_graph_captures == (3 if expected and fusion_on else 0)
             print('graph policy passed')
         ''')
         # Use the same source tree and isolated extension selected by the parent.
         code = 'import sys\nsys.path[:0] = ' + repr(sys.path) + '\n' + code
         code += '\nassert ext.__file__ == ' + repr(ext.__file__) + '\n'
-        for global_flag,native_flag in itertools.product((None,'0','1'), repeat=2):
-            with self.subTest(global_flag=global_flag,native_flag=native_flag):
+        for global_flag,native_flag,fusion_flag in itertools.product((None,'0','1'), repeat=3):
+            with self.subTest(global_flag=global_flag,native_flag=native_flag,fusion_flag=fusion_flag):
                 env = os.environ.copy()
-                for key,value in (('EXL3_GRAPHS',global_flag),('EXL3_NATIVE_TP_GRAPHS',native_flag)):
+                for key,value in (('EXL3_GRAPHS',global_flag),('EXL3_NATIVE_TP_GRAPHS',native_flag),
+                                  ('EXL3_NATIVE_TP_HC_FUSION',fusion_flag)):
                     if value is None:
                         env.pop(key,None)
                     else:

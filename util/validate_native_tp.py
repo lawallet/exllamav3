@@ -208,6 +208,8 @@ def main():
     p.add_argument('--batches', type=int, nargs='+', default=[1, 2])
     p.add_argument('--queries', type=int, nargs='+', default=[1])
     p.add_argument('--runs', type=int, default=3)
+    p.add_argument('--stock-noise-repeats', type=int, default=1,
+                   help='TP3 stock repeats on fixed tokens to characterize reduction-order noise')
     p.add_argument('--reload', action='store_true')
     p.add_argument('--profile', action='store_true', help='profile timed regions; reported timings are instrumented')
     p.add_argument('--generator', action='store_true', help='also test concurrent generation and prompt-cache reuse')
@@ -215,6 +217,8 @@ def main():
     p.add_argument('--generator-bench', action='store_true', help='benchmark actual MTP generation without traces/hashes')
     p.add_argument('--generator-bench-runs', type=int, default=3)
     a = p.parse_args()
+    if a.stock_noise_repeats < 1:
+        p.error('--stock-noise-repeats must be positive')
     if a.generator_bench and not a.mtp:
         p.error('--generator-bench requires --mtp')
     sys.path.insert(1, str(a.extension_dir.resolve()))
@@ -566,13 +570,17 @@ def main():
                         result['ranks_identical'] = all(r['trace'] == new['evidence'][0]['trace'] for r in new['evidence'])
                         result['state_exact'] = ref['state'] == new['state']
                         if three:
-                            repeat, repeat_logits, repeat_pre = run(False, batch, query, forced=ref['generated'])
                             def errors_against(values, pre):
                                 delta = torch.cat([(x.float()-y.float()).flatten() for x,y in
                                                    zip([ref_pre]+ref_logits, [pre]+values)])
                                 return dict(max_abs=float(delta.abs().max()), rmse=float(delta.square().mean().sqrt()))
-                            noise = errors_against(repeat_logits, repeat_pre)
+                            noise_samples = []
+                            for _ in range(a.stock_noise_repeats):
+                                _, repeat_logits, repeat_pre = run(False, batch, query, forced=ref['generated'])
+                                noise_samples.append(errors_against(repeat_logits, repeat_pre))
+                            noise = {k:max(s[k] for s in noise_samples) for k in ('max_abs','rmse')}
                             error = errors_against(new_logits, new_pre)
+                            result['stock_repeat_noise_samples'] = noise_samples
                             result['stock_repeat_noise'] = noise
                             result['native_error'] = error
                             result['local_stages_exact'] = all(r['shadow_checks'] >= 4*a.steps*len(r['blocks']) for r in new['evidence'])

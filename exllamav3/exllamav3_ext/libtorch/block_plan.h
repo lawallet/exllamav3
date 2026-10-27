@@ -28,10 +28,13 @@ struct BC_BlockPlan {
     };
     std::vector<GraphBinding> graph_bindings;
     // Begin has no dynamic boundary; middle specializes its boundary dtype.
-    std::array<std::unique_ptr<Graph>, 3> stage_graphs;
+    // Separate ordinary/fused slots allow matched A/B switching without capture.
+    std::array<std::unique_ptr<Graph>, 6> stage_graphs;
     std::array<bool, 2> graph_eligible = {false, false};
     bool graphs_enabled = false;
+    bool hc_fusion_enabled = false;
     uint64_t graph_captures = 0, graph_replays = 0;
+    uint64_t fused_graph_captures = 0, fused_graph_replays = 0;
     BC_BlockPlan(std::vector<std::vector<at::Tensor>> weights,
         std::vector<int64_t> kinds, std::vector<double> eps,
         std::vector<double> hc_eps, std::vector<int64_t> iterations,
@@ -40,6 +43,7 @@ struct BC_BlockPlan {
         int64_t batch, int64_t query);
     ~BC_BlockPlan();
     void set_graphs(bool enabled);
+    void set_hc_fusion(bool enabled) { hc_fusion_enabled = enabled; }
     void execute_graph(size_t stage, const at::Tensor& residual, at::Tensor y);
     at::Tensor begin(const at::Tensor& x);
     at::Tensor middle(const at::Tensor& x, const at::Tensor& y);

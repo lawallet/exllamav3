@@ -20,15 +20,18 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 
-def set_mode(context, enabled, graphs=False):
+def set_mode(context, enabled, graphs=False, fusion=False):
     from exllamav3.modules import native_plan, native_tp
     native_plan.enabled = enabled
     native_tp.hc_graphs_enabled = graphs
+    native_tp.hc_fusion_enabled = fusion
     context['final_ir_graphs'] = graphs
     for block in context['modules']:
         for signature, plan in getattr(block, '_native_tp_plans', {}).values():
             if hasattr(plan, 'set_graphs'):
                 plan.set_graphs(graphs and getattr(block, '_native_tp_kind', None) == 'glm')
+                if hasattr(plan, 'set_hc_fusion'):
+                    plan.set_hc_fusion(fusion and getattr(block, '_native_tp_kind', None) == 'glm')
 
 
 def rank_report(context):
@@ -39,6 +42,8 @@ def rank_report(context):
              for signature,plan in getattr(block, '_native_tp_plans', {}).values()]
     result['graph_captures'] = sum(getattr(p, 'graph_captures', 0) for p in plans)
     result['graph_replays'] = sum(getattr(p, 'graph_replays', 0) for p in plans)
+    result['fused_graph_captures'] = sum(getattr(p, 'fused_graph_captures', 0) for p in plans)
+    result['fused_graph_replays'] = sum(getattr(p, 'fused_graph_replays', 0) for p in plans)
     device = context['device']
     result['memory'] = dict(allocated=torch.cuda.memory_allocated(device),
                            reserved=torch.cuda.memory_reserved(device),
@@ -148,7 +153,7 @@ def main():
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--lengths', type=int, nargs='+', default=[128, 1024, 2048, 4096, 8192])
     p.add_argument('--runs', type=int, default=3)
-    p.add_argument('--modes', choices=['stock', 'native', 'graphs'], nargs='+', default=['stock', 'native'])
+    p.add_argument('--modes', choices=['stock', 'native', 'graphs', 'fused'], nargs='+', default=['stock', 'native'])
     p.add_argument('--mtp', action='store_true')
     p.add_argument('--single', action='store_true')
     p.add_argument('--batch', type=int, default=1)
@@ -178,8 +183,10 @@ def main():
     torch.set_grad_enabled(False)
     assert Path(exllamav3.__file__).parent == ROOT / 'exllamav3'
     assert Path(ext.__file__).parent.resolve() == a.extension_dir.resolve()
-    if 'graphs' in a.modes:
+    if any(m in a.modes for m in ('graphs', 'fused')):
         assert not a.single and hasattr(ext.BC_BlockPlan, 'set_graphs'), 'Graphs require the experimental TP extension'
+    if 'fused' in a.modes:
+        assert hasattr(ext.BC_BlockPlan, 'set_hc_fusion'), 'Fusion requires the experimental extension'
     assert torch.cuda.device_count() == 1 if a.single else torch.cuda.device_count() >= 2
     a.output.mkdir(parents=True, exist_ok=False)
 
@@ -214,7 +221,7 @@ def main():
     save('source-hashes.json', initial)
     (a.output / 'driver.py').write_bytes(Path(__file__).read_bytes())
     cfg = Config.from_directory(a.model)
-    if 'graphs' in a.modes and not cfg.arch_string.startswith('Glm5'):
+    if any(m in a.modes for m in ('graphs', 'fused')) and not cfg.arch_string.startswith('Glm5'):
         p.error('Stage graph comparisons are enabled only for the validated GLM TP path')
     model, tokenizer = Model.from_config(cfg), Tokenizer.from_config(cfg)
     cache = Cache(model, max_num_tokens=65536, max_batch_size=a.batch, max_history=5)
@@ -235,7 +242,7 @@ def main():
         enabled = mode != 'stock'
         native_plan.enabled = enabled
         if not a.single:
-            model.tp_dispatch_all(set_mode, (enabled, mode == 'graphs'))
+            model.tp_dispatch_all(set_mode, (enabled, mode in ('graphs','fused'), mode == 'fused'))
 
     def reports():
         if a.single:
@@ -379,6 +386,8 @@ def main():
                        builds=sum(b['builds']-old['builds'] for b,old in zip(r['blocks'], prior['blocks'])),
                        graph_captures=r['graph_captures']-prior['graph_captures'],
                        graph_replays=r['graph_replays']-prior['graph_replays'],
+                       fused_graph_captures=r['fused_graph_captures']-prior['fused_graph_captures'],
+                       fused_graph_replays=r['fused_graph_replays']-prior['fused_graph_replays'],
                        fallbacks=dict(sum((Counter(b['fallbacks'])-Counter(old['fallbacks'])
                            for b,old in zip(r['blocks'], prior['blocks'])), Counter())))
                   for r,prior in zip(after,before)]
@@ -388,8 +397,10 @@ def main():
                 assert all(r['executions'] == 0 for r in deltas), 'Stock sample executed IR'
             elif a.batch == 1:
                 assert all(r['executions'] > 0 for r in deltas), 'Native sample only fell back'
-            if mode == 'graphs':
+            if mode in ('graphs', 'fused'):
                 assert all(r['graph_replays'] > 0 for r in deltas), 'Graph sample did not replay any IR graph'
+            assert all(r['fused_graph_replays'] == (r['graph_replays'] if mode == 'fused' else 0)
+                       for r in deltas), 'Wrong graph variant executed'
         return dict(mode=mode, length=length, instrumented=instrument, seconds=elapsed,
                     started_unix=started_unix, observed_start_tokens=observed_start,
                     rank_host_timings=rank_host, parent_host_timings=parent_host,
@@ -447,11 +458,16 @@ def main():
                 save(f'post-profile-warm-{mode}.json', sample(mode, 128))
         for length in a.lengths:
             for pair in range(a.runs):
-                for mode in (a.modes if pair % 2 == 0 else a.modes[::-1]):
+                # With three variants, rotate so each occupies every ordinal
+                # position once over three rounds; retain paired reversal for two.
+                order = (a.modes[pair % len(a.modes):] + a.modes[:pair % len(a.modes)]
+                         if len(a.modes) > 2 else (a.modes if pair % 2 == 0 else a.modes[::-1]))
+                for mode in order:
                     print('START', length, pair, mode, flush=True)
                     row = dict(pair=pair, **sample(mode, length))
                     results.append(row)
                     save('results.json', results)
+                    assert all(r['graph_captures'] == 0 for r in row['deltas']), 'Capture during timing'
                     if torch.cuda.device_count() <= 2 and a.batch == 1:
                         parity = (row['completion_hashes'], [(s['new_tokens'], s['accepted_draft_tokens'],
                                   s['rejected_draft_tokens']) for s in row['stats']])
