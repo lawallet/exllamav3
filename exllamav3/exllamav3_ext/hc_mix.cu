@@ -1006,6 +1006,19 @@ static void hc_mix_launch
     #undef ARGS_A
     #undef ARGS_C
     cuda_check(cudaPeekAtLastError());
+    if (graph)
+    {
+        void* partial = head
+            ? (fn_half ? (void*)hc_mix_partials_kernel<4,4,half> : (void*)hc_mix_partials_kernel<4,4,float>)
+            : (fn_half ? (void*)hc_mix_partials_kernel<4,24,half> : (void*)hc_mix_partials_kernel<4,24,float>);
+        void* finalize = head
+            ? (half_out ? (void*)hc_mix_finalize_kernel<4,4,true,true> : (void*)hc_mix_finalize_kernel<4,4,true,false>)
+            : (half_out ? (void*)hc_mix_finalize_kernel<4,24,false,true> : (void*)hc_mix_finalize_kernel<4,24,false,false>);
+        graph->record_param(partial, GP_hc_streams, 0);
+        graph->record_param(partial, GP_end, 0);
+        graph->record_param(finalize, GP_hc_streams, 0);
+        graph->record_param(finalize, GP_end, 0);
+    }
 }
 
 int hc_mix_num_chunks(int R, int row_len)
@@ -1148,18 +1161,28 @@ void hc_head
     );
 }
 
-void hc_apply
+void hc_mix_gr(const at::Tensor& streams, const at::Tensor& fn,
+    const at::Tensor& base, const at::Tensor& scale, double rms_eps,
+    double hc_eps, int64_t sinkhorn_iters, at::Tensor partials, at::Tensor post,
+    at::Tensor comb, at::Tensor collapsed, Graph* graph)
+{
+    hc_mix_launch(streams, fn, base, scale, (float)rms_eps, (float)hc_eps,
+                  (int)sinkhorn_iters, partials, &post, &comb, collapsed, graph);
+}
+
+static void hc_apply_launch
 (
     at::Tensor x,                        // (R, H, D) float, updated IN PLACE
     const at::Tensor& y,                 // (R, D) float or half
     const at::Tensor& post,              // (R, H) float
     const c10::optional<at::Tensor>& comb,  // (R, H, H) float, or none (x[h] += post[h] * y)
     const c10::optional<at::Tensor>& wn,    // (H * D) half: next site's norm weight, with xw
-    c10::optional<at::Tensor> xw         // (R, H, D) float out: updated x * wn, or none
+    c10::optional<at::Tensor> xw,        // (R, H, D) float out: updated x * wn, or none
+    Graph* graph
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_DTYPE(x, kFloat);
     TORCH_CHECK_DTYPE(post, kFloat);
@@ -1214,6 +1237,31 @@ void hc_apply
     #undef LAUNCH
     #undef ARGS
     cuda_check(cudaPeekAtLastError());
+    if (graph)
+    {
+        // The graphable entry point below only exposes the HC form.
+        TORCH_CHECK(comb_p && !xw_p, "hc_apply graph: HC combine required");
+        void* kernel = y.dtype() == at::kHalf
+            ? (void*)hc_apply_kernel<4,half,true,false>
+            : (void*)hc_apply_kernel<4,float,true,false>;
+        graph->record_param(kernel, GP_hc_streams, 0);
+        graph->record_param(kernel, GP_hc_boundary, 1);
+        graph->record_param(kernel, GP_end, 0);
+    }
+}
+
+void hc_apply(at::Tensor x, const at::Tensor& y, const at::Tensor& post,
+    const c10::optional<at::Tensor>& comb, const c10::optional<at::Tensor>& wn,
+    c10::optional<at::Tensor> xw)
+{
+    hc_apply_launch(x, y, post, comb, wn, xw, nullptr);
+}
+
+void hc_apply_gr(at::Tensor x, const at::Tensor& y, const at::Tensor& post,
+    const c10::optional<at::Tensor>& comb, Graph* graph)
+{
+    TORCH_CHECK(comb.has_value(), "hc_apply graph: HC combine required");
+    hc_apply_launch(x, y, post, comb, c10::nullopt, c10::nullopt, graph);
 }
 
 #if defined(USE_ROCM)

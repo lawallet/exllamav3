@@ -1,5 +1,9 @@
 # ExLlamaV3 v1.6.5 native IR / TP integration
 
+The subsequent merge of the deferred GLM optimization commits is documented in
+[the follow-up report](native_plan_v165_final_ir.md). This report retains the
+scope and measurements of the original `native-plan-v1.6.5-integration-v1` checkpoint.
+
 ## Provenance
 
 The original branch is `feature/native-ir-tensor-parallel`, at

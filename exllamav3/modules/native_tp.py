@@ -4,6 +4,7 @@ Only registrations already attached to a supported model can cross the export
 boundary. Attention/MLP remain upstream modules, including on empty-shard ranks.
 """
 import math
+import os
 import warnings
 from collections import Counter
 
@@ -18,6 +19,19 @@ from .hyperconnections import GatedResidual, HyperConnection
 _FLOAT_TINY = torch.finfo(torch.float32).tiny
 _FLOAT_MAX = torch.finfo(torch.float32).max
 _OP_COUNTS = dict(qwen=4, glm=6, deepseek=6, gemma=4, devstral=3)
+# Resolved at import; only used when constructing an HC plan. Older extensions
+# continue to use eager stages, and operators can opt out before startup.
+hc_graphs_enabled = os.environ.get('EXL3_NATIVE_TP_GRAPHS', '1') == '1'
+_hc_graphs_available = hasattr(getattr(native_plan.ext, 'BC_BlockPlan', object), 'set_graphs')
+
+
+def _hc_plan(sites, batch, query, *, kind):
+    plan = native_plan.deepseek(sites, batch, query)
+    # GLM has a repeatable sustained-generation gain. DeepSeek's existing long
+    # MTP repeatability issue prevents certifying that workload; keep it eager.
+    if kind == 'glm' and hc_graphs_enabled and _hc_graphs_available:
+        plan.set_graphs(True)
+    return plan
 
 
 def export_kind(block):
@@ -258,7 +272,7 @@ def _streams(block, x, reject):
             if not _valid(h.fn_h, x.device, (24, 16384), (torch.float16,)):
                 return reject('HC half projection')
         signature = signature_for_sites()
-        build = lambda: native_plan.deepseek(sites, *x.shape[:2])
+        build = lambda: _hc_plan(sites, *x.shape[:2], kind=kind)
     return _cached(block, x, signature, build)
 
 
@@ -275,9 +289,12 @@ def diagnostics(context):
     blocks = []
     for block in context['modules']:
         if getattr(block, '_native_tp_kind', None) is not None:
+            plans = [p[1] for p in block._native_tp_plans.values()]
             blocks.append(dict(key=block.key, kind=block._native_tp_kind,
                                plans=len(block._native_tp_plans),
-                               plan_types=sorted({type(p[1]).__name__ for p in block._native_tp_plans.values()}),
+                               plan_types=sorted({type(p).__name__ for p in plans}),
+                               graph_captures=sum(getattr(p, 'graph_captures', 0) for p in plans),
+                               graph_replays=sum(getattr(p, 'graph_replays', 0) for p in plans),
                                attention_heads=getattr(block.attn, 'num_q_heads', None),
                                mlp_channels=getattr(block.mlp, 'intermediate_size', None),
                                **(block._native_tp_stats | {'fallbacks':dict(block._native_tp_stats['fallbacks'])})))
