@@ -56,6 +56,7 @@
 #include "parallel/barrier.cuh"
 #include "parallel/gather.cuh"
 #include "parallel/all_reduce.cuh"
+#include "parallel/tp_profile.h"
 
 #include "libtorch/gated_delta_net.h"
 #include "libtorch/glm_block.h"
@@ -167,6 +168,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("pg_all_reduce", &pg_all_reduce, "pg_all_reduce");
     m.def("pg_all_reduce_cpu", &pg_all_reduce_cpu, "pg_all_reduce_cpu");
     m.def("run_cpu_reduce_jobs", &run_cpu_reduce_jobs, "run_cpu_reduce_jobs");
+    m.def("tp_profile_begin", &tp_profile::begin, "Enable bounded CPU-helper profiling on this thread");
+    m.def("tp_profile_end", &tp_profile::end, "Stop profiling and return CPU-helper records");
+    m.def("tp_profile_clock_ns", &tp_profile::clock_ns);
+    m.def("tp_profile_dropped", []() { return tp_profile::dropped; });
     m.def("end_cpu_reduce_jobs", &end_cpu_reduce_jobs, "end_cpu_reduce_jobs");
 
     m.def("quantize_tiles", &quantize_tiles, "quantize_tiles");

@@ -122,6 +122,7 @@ def single_device_ranks(device, other) -> tuple[list[int], list[dict]]:
 
 def run_ranks(program, ranks: list[int], *args, output_rank: int = -1, rank_envs: list[dict] | None = None,
               env: dict | None = None, scramble_context: bool = False, timeout: float = 300.0,
+              cpu_profile: dict | None = None,
               **kwargs) -> list:
     path = os.path.abspath(inspect.getsourcefile(program))
     name = program.__name__
@@ -138,7 +139,7 @@ def run_ranks(program, ranks: list[int], *args, output_rank: int = -1, rank_envs
         with tempfile.TemporaryDirectory(prefix = "exl3_tp_") as tmp, ExitStack() as logs:
             spec = dict(path = path, name = name, args = args, kwargs = kwargs, ranks = ranks, uuid = uid,
                         output_device = output_device, participants = participants,
-                        scramble_context = scramble_context)
+                        scramble_context = scramble_context, cpu_profile = cpu_profile)
             spec_file = os.path.join(tmp, "spec.pkl")
             with open(spec_file, "wb") as f:
                 pickle.dump(spec, f)
@@ -224,6 +225,10 @@ def _child_main():
 
     if role == "cpu":
         backend = TPBackendNative(-1, ranks, output_device, "", master = False, uuid = uid, cpu = True)
+        profile = spec.get("cpu_profile")
+        if profile:
+            from exllamav3.ext import exllamav3_ext as ext
+            ext.tp_profile_begin(profile['capacity'])
         barrier.wait()
         # As in model_tp.py, where the helper is dispatched at the start of each forward pass, run_cpu_reduce_jobs
         # is entered only when a round has work queued (its wait timeout counts from the call)
@@ -235,6 +240,11 @@ def _child_main():
             if u32[head].item() == u32[tail].item():
                 break
             backend.run_cpu_reduce_jobs()
+        if profile:
+            import json
+            from pathlib import Path
+            Path(profile['path']).write_text(json.dumps(dict(
+                rows=ext.tp_profile_end(), dropped=ext.tp_profile_dropped())))
         barrier.wait()
         backend.close()
         barrier.close()

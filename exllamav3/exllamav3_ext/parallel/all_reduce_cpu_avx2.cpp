@@ -2,6 +2,7 @@
 #include <immintrin.h>
 #include "all_reduce_cpu_avx2.h"
 #include "all_reduce_cpu_avx512.h"
+#include "tp_profile.h"
 #include "../avx2_target.h"
 #include "../avx512_target.h"
 #include "../util.h"
@@ -464,6 +465,7 @@ void perform_cpu_reduce
     size_t shbuf_size
 )
 {
+    if (tp_profile::current) (*tp_profile::current)[tp_profile::tier] = reduce_tier();
     switch (reduce_tier())
     {
         case REDUCE_TIER_AVX512:
@@ -534,6 +536,7 @@ static void perform_cpu_reduce_with
     ReduceKernels k
 )
 {
+    auto* profile = tp_profile::current;
     // Indexing - original MAX_DEVICES-based layout
     const uint32_t buf_slot_size = (shbuf_size / (MAX_DEVICES + 1) / 1024) * 1024;
     const uint32_t max_buf_stages = buf_slot_size / CPUREDUCE_CHUNK_SIZE;
@@ -623,6 +626,8 @@ static void perform_cpu_reduce_with
                 // Device is ready
                 if (cpusum_device_arrived(ctx, device, stage, multi, &no_contrib))
                 {
+                    if (profile && chunk_idx == 0)
+                        (*profile)[tp_profile::arrivals + device] = tp_profile::clock_ns();
                     rem_devices &= ~(1 << device);
 
                     if (!no_contrib)
@@ -639,6 +644,7 @@ static void perform_cpu_reduce_with
                         }
                         else if (first_src != dst)
                         {
+                            tp_profile::Duration measured_math(profile, tp_profile::math_ns);
                             // Second contribution: fused add of first + second -> dst
                             cpu_reduce_parallel(
                                 k.twosrc,
@@ -653,6 +659,7 @@ static void perform_cpu_reduce_with
                         }
                         else
                         {
+                            tp_profile::Duration measured_math(profile, tp_profile::math_ns);
                             // Third+ contribution: accumulate into dst
                             cpu_reduce_parallel(
                                 nullptr,
@@ -691,11 +698,13 @@ static void perform_cpu_reduce_with
         // No device contributed: the sum is zero (the slot still holds an earlier stage's result)
         if (first_src == nullptr)
         {
+            tp_profile::Duration measured_math(profile, tp_profile::math_ns);
             memset(host_ptr(MAX_DEVICES, stage), 0, stage_size);
         }
         // Only one device contributed (no add needed, just copy)
         else if (first_src != host_ptr(MAX_DEVICES, stage))
         {
+            tp_profile::Duration measured_math(profile, tp_profile::math_ns);
             memcpy(host_ptr(MAX_DEVICES, stage), first_src, stage_size);
         }
 
@@ -704,6 +713,11 @@ static void perform_cpu_reduce_with
         stage = next_stage;
         next_stage = (stage + 1u) & 0x7fffffffu;
         stage_.store_release(stage);
+        if (profile)
+        {
+            ++(*profile)[tp_profile::chunks];
+            (*profile)[tp_profile::published] = tp_profile::clock_ns();
+        }
 
         // We can exit here if we're done and start waiting for the next job. Devices will still be reading the last
         // chunk, but the host buffer is reserved for this operation and we have at most two active stages in the

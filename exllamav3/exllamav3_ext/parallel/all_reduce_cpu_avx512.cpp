@@ -2,6 +2,7 @@
 #include <immintrin.h>
 #include "all_reduce_cpu_avx512.h"
 #include "all_reduce_cpu_avx2.h"
+#include "tp_profile.h"
 #include "../avx512_target.h"
 #include "../util.h"
 
@@ -343,6 +344,8 @@ void perform_cpu_reduce_avx512
                 bool no_contrib;
                 if (cpusum_device_arrived(ctx, device, stage, multi, &no_contrib))
                 {
+                    if (tp_profile::current && chunk_idx == 0)
+                        (*tp_profile::current)[tp_profile::arrivals + device] = tp_profile::clock_ns();
                     rem_devices &= ~(1 << device);
 
                     if (!no_contrib)
@@ -358,6 +361,7 @@ void perform_cpu_reduce_avx512
                         }
                         else if (first_src != dst)
                         {
+                            tp_profile::Duration measured_math(tp_profile::current, tp_profile::math_ns);
                             // Second contribution: fused add of first + second -> dst
                             cpu_reduce_parallel(
                                 wire_dtype == REDUCE_WIRE_FP16 ? fp16_add_twosrc_avx512 : bf16_add_twosrc_avx512,
@@ -372,6 +376,7 @@ void perform_cpu_reduce_avx512
                         }
                         else
                         {
+                            tp_profile::Duration measured_math(tp_profile::current, tp_profile::math_ns);
                             // Third+ contribution: accumulate into dst
                             cpu_reduce_parallel(
                                 nullptr,
@@ -408,17 +413,24 @@ void perform_cpu_reduce_avx512
         // No device contributed: the sum is zero (the slot still holds an earlier stage's result)
         if (first_src == nullptr)
         {
+            tp_profile::Duration measured_math(tp_profile::current, tp_profile::math_ns);
             memset(host_ptr(MAX_DEVICES, stage), 0, stage_size);
         }
         // Only one device contributed (no add needed, just copy)
         else if (first_src != host_ptr(MAX_DEVICES, stage))
         {
+            tp_profile::Duration measured_math(tp_profile::current, tp_profile::math_ns);
             memcpy(host_ptr(MAX_DEVICES, stage), first_src, stage_size);
         }
 
         stage = next_stage;
         next_stage = (stage + 1u) & 0x7fffffffu;
         stage_.store_release(stage);
+        if (tp_profile::current)
+        {
+            ++(*tp_profile::current)[tp_profile::chunks];
+            (*tp_profile::current)[tp_profile::published] = tp_profile::clock_ns();
+        }
 
         num_chunks--;
         chunk_idx++;

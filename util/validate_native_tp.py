@@ -205,9 +205,13 @@ def main():
     p.add_argument('--context', type=int, default=256)
     p.add_argument('--steps', type=int, default=16)
     p.add_argument('--bench-steps', type=int, default=128)
+    p.add_argument('--bench-query', type=int, default=1, choices=[1, 2, 3, 4],
+                   help='Target rows per timed forward; multi-row replay is not an end-to-end MTP benchmark')
     p.add_argument('--batches', type=int, nargs='+', default=[1, 2])
     p.add_argument('--queries', type=int, nargs='+', default=[1])
     p.add_argument('--runs', type=int, default=3)
+    p.add_argument('--stock-noise-repeats', type=int, default=1,
+                   help='TP3 reference repeats on fixed tokens to characterize reduction-order noise')
     p.add_argument('--reload', action='store_true')
     p.add_argument('--profile', action='store_true', help='profile timed regions; reported timings are instrumented')
     p.add_argument('--generator', action='store_true', help='also test concurrent generation and prompt-cache reuse')
@@ -215,6 +219,8 @@ def main():
     p.add_argument('--generator-bench', action='store_true', help='benchmark actual MTP generation without traces/hashes')
     p.add_argument('--generator-bench-runs', type=int, default=3)
     a = p.parse_args()
+    if a.stock_noise_repeats < 1:
+        p.error('--stock-noise-repeats must be positive')
     if a.generator_bench and not a.mtp:
         p.error('--generator-bench requires --mtp')
     sys.path.insert(1, str(a.extension_dir.resolve()))
@@ -231,7 +237,7 @@ def main():
         p.error('TP validation requires at least two visible GPUs; one-rank TP is prohibited')
     if a.single and torch.cuda.device_count() != 1:
         p.error('--single requires one visible GPU with TP disabled')
-    if a.context + max(a.steps * max(a.queries), a.bench_steps) + 16 > 65536 // max(a.batches):
+    if a.context + max(a.steps * max(a.queries), a.bench_steps*a.bench_query) + 16 > 65536 // max(a.batches):
         p.error('workload exceeds the 65536-token cache capacity')
     assert native_plan.available and native_plan.v2_residual_available, ext.__file__
     assert Path(ext.__file__).parent.resolve() == a.extension_dir.resolve(), ext.__file__
@@ -453,6 +459,8 @@ def main():
                 model.tp_dispatch_all(profile, (str((a.output / f'profile-{int(enabled)}').resolve()),))
             outputs = []
             generated = []
+            timed_before = reports() if timed and not a.single else []
+            initial_input = current.tolist() if timed else None
             start = time.perf_counter()
             for step in range(steps):
                 logits = forward(current)
@@ -466,6 +474,17 @@ def main():
             if timed and a.profile and not a.single:
                 model.tp_dispatch_all(profile, (None,))
             evidence = reports()
+            timed_graph_deltas = []
+            if timed:
+                for before, after in zip(timed_before, evidence):
+                    if 'graph_captures' not in after:
+                        continue
+                    delta = dict(rank=after['rank'],
+                        captures=after['graph_captures']-before['graph_captures'],
+                        replays=after['graph_replays']-before['graph_replays'],
+                        executions=sum(b['executions']-p['executions'] for b,p in zip(after['blocks'],before['blocks'])))
+                    timed_graph_deltas.append(delta)
+                    assert delta['captures'] == 0, 'Graph capture occurred in a timed replay region'
             state = None
             if not timed and not a.single:
                 slots = [(s.slot, getattr(s, 'window_beg', 0),
@@ -483,6 +502,10 @@ def main():
                         tokens_per_second=batch*steps*query/elapsed, steps=steps, evidence=evidence,
                         state=state,
                         generated=generated, last_logits=digest(logits),
+                        timed_graph_deltas=timed_graph_deltas,
+                        timed_input_hash=hashlib.sha256(json.dumps(
+                            [initial_input, *((forced if forced is not None else generated)[:-1])]
+                        ).encode()).hexdigest() if timed else None,
                         peak_allocated=torch.cuda.max_memory_allocated() if a.single else None,
                         single_counts=single_counts.copy() if a.single else None), outputs, prefill_logits
         finally:
@@ -566,13 +589,17 @@ def main():
                         result['ranks_identical'] = all(r['trace'] == new['evidence'][0]['trace'] for r in new['evidence'])
                         result['state_exact'] = ref['state'] == new['state']
                         if three:
-                            repeat, repeat_logits, repeat_pre = run(False, batch, query, forced=ref['generated'])
                             def errors_against(values, pre):
                                 delta = torch.cat([(x.float()-y.float()).flatten() for x,y in
                                                    zip([ref_pre]+ref_logits, [pre]+values)])
                                 return dict(max_abs=float(delta.abs().max()), rmse=float(delta.square().mean().sqrt()))
-                            noise = errors_against(repeat_logits, repeat_pre)
+                            noise_samples = []
+                            for _ in range(a.stock_noise_repeats):
+                                _, repeat_logits, repeat_pre = run(False, batch, query, forced=ref['generated'])
+                                noise_samples.append(errors_against(repeat_logits, repeat_pre))
+                            noise = {k:max(s[k] for s in noise_samples) for k in ('max_abs','rmse')}
                             error = errors_against(new_logits, new_pre)
+                            result['stock_repeat_noise_samples'] = noise_samples
                             result['stock_repeat_noise'] = noise
                             result['native_error'] = error
                             result['local_stages_exact'] = all(r['shadow_checks'] >= 4*a.steps*len(r['blocks']) for r in new['evidence'])
@@ -592,10 +619,11 @@ def main():
                 timings = []
                 for pair in range(a.runs):
                     for enabled in ([True] if a.single and not a.single_parity else ([False,True] if pair%2==0 else [True,False])):
-                        measured, _, _ = run(enabled, 1, 1, timed=True,
+                        measured, _, _ = run(enabled, 1, a.bench_query, timed=True,
                                              forced=timings[0]['generated'] if timings and not a.single and torch.cuda.device_count()>2 else None)
                         timings.append(dict(pair=pair, native=enabled, **measured))
                         save('timings.json', timings)
+                        assert all(t['timed_input_hash'] == timings[0]['timed_input_hash'] for t in timings), 'Timed target input mismatch'
                         if a.single or torch.cuda.device_count() == 2:
                             assert all(t['generated'] == timings[0]['generated'] and t['last_logits'] == timings[0]['last_logits'] for t in timings), 'Timed trajectory mismatch'
                         print('TIMING', pair, enabled, measured['tokens_per_second'], flush=True)

@@ -16,6 +16,7 @@ namespace cg = cooperative_groups;
 #include <chrono>
 #include "../avx2_target.h"
 #include "all_reduce_cpu_avx2.h"
+#include "tp_profile.h"
 
 #ifndef __linux__
 #include <intrin.h>
@@ -106,6 +107,8 @@ void run_cpu_reduce_jobs
     {
         // The timeout bounds each wait for the next job, not the whole round, which may run for as long as the
         // forward pass that feeds it
+        tp_profile::Job profile_job;
+        auto* profile = profile_job.row;
         const auto deadline = std::chrono::steady_clock::now() + (first ? first_wait : in_pass_wait);
 
         // Wait for next job. Jobs are pushed just-in-time by the master's dispatch loop, so the
@@ -132,7 +135,11 @@ void run_cpu_reduce_jobs
                 #endif
                 continue;
             }
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            {
+                tp_profile::Duration measured_sleep(profile, tp_profile::sleep_ns);
+                if (profile) ++(*profile)[tp_profile::sleeps];
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
             if (std::chrono::steady_clock::now() > deadline)
             {
                 // Past the deadline for the queue to build, something surely crashed
@@ -141,6 +148,13 @@ void run_cpu_reduce_jobs
             }
         }
 
+        if (profile)
+        {
+            (*profile)[tp_profile::ready] = tp_profile::clock_ns();
+            (*profile)[tp_profile::bytes] = current_job.data_size;
+            (*profile)[tp_profile::mask] = current_job.device_mask;
+            (*profile)[tp_profile::wire] = current_job.wire_dtype;
+        }
         // No more work
         if (current_job.data_size == 0)
             return;
