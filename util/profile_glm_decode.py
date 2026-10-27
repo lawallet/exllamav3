@@ -74,7 +74,9 @@ def main():
     prompt = model.default_chat_prompt('Explain how a computer executes a program, from source code to processor instructions. Include concrete examples and explain each stage in detail.')
     (args.output / 'prompt.txt').write_text(prompt, encoding='utf-8')
     prompt_tokens = tokenizer.encode(prompt, encode_special_tokens=True).shape[-1]
-    cache_size = ((prompt_tokens + max(args.tokens, args.profile_tokens) + 255) // 256) * 256
+    # The parity gate decodes 256 tokens and warmup decodes 128, even in smoke
+    # mode with a shorter timed run. Reserve space for those untimed paths too.
+    cache_size = ((prompt_tokens + max(args.tokens, args.profile_tokens, 256 if args.ab else 128) + 255) // 256) * 256
     cache = Cache(model, max_num_tokens=cache_size)
     model.load(use_per_device=args.split, tensor_p=False, max_chunk_size=256,
                max_batch_size=1, progressbar=True, verbose=True)

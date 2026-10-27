@@ -17,6 +17,13 @@ from ..tokenizer import MMEmbedding
 from functools import lru_cache
 from ..util import profile_opt
 
+
+class NonFiniteLogits(RuntimeError):
+    """A decode step produced NaN/Inf logits. Almost always a kernel bug (e.g. a miscompiled
+    Triton specialization) rather than bad inputs; the message lists the toggles that A/B the
+    fused decode paths to bisect with."""
+
+
 # Convert list of strings to UTF32 format to pass by reference to partial matching function
 @lru_cache(100)
 def _strings_to_utf32(strings: tuple[str]) -> tuple[np.ndarray, np.ndarray] | None:
@@ -271,6 +278,7 @@ class Job:
         self.rq_prompt_tokens = rq_state.get("prompt_tokens")
         self.rq_cached = rq_state.get("cached")
         self.draft_stats = []
+        self.sparse_head_seeded = False
         self.cached_pages = 0
         self.cached_tokens = 0
         self.is_finished = False
@@ -312,6 +320,7 @@ class Job:
 
         # N-gram automaton
         self.sam = rq_state.get("sam", None)
+        self.sam_match = None
 
         # MTP state
         self.mtp_last_hidden = None
@@ -659,8 +668,8 @@ class Job:
         # A deferred page may already anchor a recurrent checkpoint, stashed under the hash it had when
         # the position crossed the boundary. Move it along so it stays findable under the final hash
         rc = self.generator.recurrent_cache
-        if rc is not None and old_hash in rc and new_hash not in rc:
-            rc[new_hash] = rc.pop(old_hash)
+        if rc is not None:
+            rc.rekey(old_hash, new_hash)
 
         # If another referenced page has the same hash, switch to referencing that instead
         if new_hash in self.pagetable.referenced_pages:
@@ -726,6 +735,19 @@ class Job:
         # assert logits.shape[0] == len(self.sequences)
         # assert self.is_prefill_done()
         # assert all(seq.live for seq in self.sequences)
+
+        # Fail fast on NaN/Inf logits: sampling them yields a fixed garbage token (argmax over
+        # NaN is id 0) that can loop, which hides the fault. Checked on the job's first sampled
+        # token only, which costs one sync per job
+        if self.new_tokens < 1:
+            if not bool(torch.isfinite(logits).all()):
+                n_bad = int((~torch.isfinite(logits)).sum())
+                raise NonFiniteLogits(
+                    f"Job {self.identifier!r} (serial {self.serial_number}) produced {n_bad} non-finite "
+                    f"logits at step {self.new_tokens} (tensor {tuple(logits.shape)} on {logits.device}). "
+                    f"This is a kernel bug, not bad sampling settings. A/B the fused decode paths to "
+                    f"bisect: EXL3_BC_MLA=0, EXL3_BC_GDN=0, EXL3_BC_ATTN=0, EXL3_BC_DSA=0, EXL3_GRAPHS=0."
+                )
 
         # A pending forced token (constrain_output_now) replaces the sampler's choice; everything
         # downstream treats it as a regular sample. Token healing (new_tokens == -1) resolves first
@@ -862,6 +884,14 @@ class Job:
                     emit_held = True
 
             if emit_held:
+                if emit_eos and "�" in self.held_text and self.held_tokens:
+                    # The job ends with pieces still held (max_new_tokens, a filter, a stop string): characters
+                    # split across those pieces are repaired by decoding them together; a character the last
+                    # token left incomplete stays as it is, nothing more is coming
+                    self.held_text = self.generator.tokenizer.decode(
+                        self.held_tokens.torch(),
+                        decode_special_tokens = self.decode_special_tokens
+                    )[0]
                 if self.held_text != "":
                     self.full_completion += self.held_text
                     r.update({ "text": self.held_text })
@@ -909,7 +939,7 @@ class Job:
                     "cached_pages": cached[0],
                     "cached_tokens": cached[1],
                 })
-                if self.generator.draft_model or self.generator.ngram_match_min:
+                if self.generator.draft_model or self.generator.ngram_match_min or self.generator.hybrid_draft_tokens:
                     r.update({
                         "accepted_draft_tokens": self.accepted_draft_tokens,
                         "rejected_draft_tokens": self.rejected_draft_tokens
@@ -971,8 +1001,8 @@ class Job:
         if filter_eos_condition:
             return emit(results, emit_eos = True, emit_held = True, eos_reason = "end_filter")
 
-        # Hold text if it ends in an incomplete character
-        if self.held_text.endswith("�"):
+        # Hold text while it contains an incomplete character
+        if "�" in self.held_text:
             test_decode = self.generator.tokenizer.decode(
                 self.held_tokens.torch(),
                 decode_special_tokens = self.decode_special_tokens
@@ -1020,6 +1050,8 @@ class Job:
             # fed to the filters when it was sampled)
             for f in self.filters:
                 f.rewind(offset)
+            # The suffix automaton re-accepts from the truncated sequence on its next query
+            self.sam_match = None
 
             # The attention cache rewinds by truncation, but recurrent states advance destructively. SWA states
             # can roll back in place within their stored window; other states are restored from the most recent
@@ -1029,20 +1061,20 @@ class Job:
             replay_from = None
             if self.recurrent_state is not None:
                 target = self.sequences[0].kv_position - offset
-                # During draft verification the state runs ahead of the accepted K/V position, so rewind by the
-                # state's actual distance from the target rather than by the checkpoint offset
-                rw = self.recurrent_state.position - target
-                if rw <= self.recurrent_state.rollback_capacity():
-                    self.recurrent_state.rewind(rw)
+                # During draft verification the state runs ahead of the accepted K/V position, so rewind to the
+                # target position rather than by the checkpoint offset; every side of the pair must be able to
+                # roll back in place, else the pair is restored from a stash
+                if self.recurrent_state.can_rewind_to(target):
+                    self.recurrent_state.rewind_to(target)
                 else:
                     stashed = self.find_recurrent_stash(target)
-                    self.recurrent_state.free()
+                    self.free_recurrent_state()
                     if stashed is not None:
                         replay_from = stashed["position"]
-                        self.recurrent_state = self.generator.cache.new_from_stashed(stashed, replay_from)
+                        self.recurrent_state = self.generator.recurrent_state_from_stashed(stashed, replay_from)
                     else:
                         replay_from = 0
-                        self.recurrent_state = self.generator.cache.get_new_state()
+                        self.recurrent_state = self.generator.new_recurrent_state()
                     self.last_recurrent_checkpoint_pos = replay_from or None
 
             for seq in self.sequences:
@@ -1245,11 +1277,19 @@ class Job:
         self.pagetable = generator.pagetable
         self.skips = 0
 
-        # No explicit limit: whatever the cache can still hold beyond the prompt, less the default
-        # requeue budget's headroom below so that budget still fits the cache exactly
+        # The cache bounds the response: past the prompt, every generated token and the drafter's
+        # speculative window (written past the budget by a verification pass) have to fit. That is
+        # the limit when none is given, and the cap on one that is, so a chunked job that writes
+        # its way to the end of the cache ends with max_new_tokens instead of asserting at the
+        # requeue that finds no pages left (the cap holds for the requeued rounds too, whose prompt
+        # is the sequence so far). A prompt with no room at all keeps its limit and fails the page
+        # check below, which is the message the caller expects for that
+        room = self.generator.max_total_tokens - max(len(s.input_ids) for s in self.sequences) \
+               - 1 - self.generator.max_draft_tokens
         if self.max_new_tokens is None:
-            self.max_new_tokens = max(1, self.generator.max_total_tokens - len(self.sequences[0].input_ids)
-                                      - 1 - self.generator.num_draft_tokens)
+            self.max_new_tokens = max(1, room)
+        elif room >= 1:
+            self.max_new_tokens = min(self.max_new_tokens, room)
 
         # Align max_rq_tokens to page boundary or recurrent checkpoint
         if self.max_rq_tokens is not None:
@@ -1258,18 +1298,23 @@ class Job:
                     if self.generator.recurrent_cache is not None else PAGE_SIZE
                 x = len(self.sequences[0].input_ids)
                 y = (x - 1 + self.max_rq_tokens + boundary - 1) // boundary * boundary
-                self.max_rq_tokens = y - x
+                # The final segment: a budget aligned to the end of the cache leaves no room for the
+                # speculative window past it, and no requeue can follow it anyway, so it is cut to what
+                # the cache holds rather than refused (issue: a 61k-token prompt in a 64k cache with a
+                # 31-token draft window could not be enqueued at all)
+                y = min(y, self.generator.max_total_tokens - self.generator.max_draft_tokens)
+                self.max_rq_tokens = max(1, y - x)
             # The requeue lands exactly on the aligned boundary, so a recurrent checkpoint stashed there
             # resumes the next segment with nothing to replay. A speculative window writes K/V past that
             # point, so drafting jobs reserve the window beyond the budget rather than requeueing early
             # (early by the window misses the boundary and replays up to a checkpoint interval; early by
             # a page shortens every segment by a page and requeues up to twice as often)
             self.rq_margin = 0
-            self.rq_headroom = self.generator.num_draft_tokens
+            self.rq_headroom = self.generator.max_draft_tokens
         else:
             # Default budget: the whole response plus one speculative window past the limit
-            self.max_rq_tokens = self.max_new_tokens + 1 + self.generator.num_draft_tokens
-            self.rq_margin = self.generator.num_draft_tokens
+            self.max_rq_tokens = self.max_new_tokens + 1 + self.generator.max_draft_tokens
+            self.rq_margin = self.generator.max_draft_tokens
             self.rq_headroom = 0
 
         # Compatibility checks
@@ -1311,7 +1356,8 @@ class Job:
             self.held_probs = SeqTensor((1, 0), dtype = torch.float, seq_dim = -1)
             self.held_logits = SeqTensor((1, 0, self.generator.padded_vocab_size), dtype = torch.float, seq_dim = 1)
             self.full_completion = ""
-            self.sam = None if not generator.ngram_match_min else ext.BC_SAM()
+            self.sam = ext.BC_SAM() if (generator.ngram_match_min or generator.hybrid_draft_tokens) else None
+            self.sam_match = None   # (sequence length, match begin, match end) of the last suffix-automaton query
             self.corpus_cursor = generator.ngram_corpus.cursor() if generator.ngram_corpus else None
 
         self.time_enqueue = time.time()
@@ -1342,7 +1388,7 @@ class Job:
         return new_pages
 
 
-    def prefill(self, results: list):
+    def prefill(self, results: list, chunk_size: int | None = None):
         """
         Run prompt prefill chunks for already allocated cache pages.
 
@@ -1350,6 +1396,9 @@ class Job:
         sequence's kv_position through the prompt, skipping any prefix whose K/V pages were already cached, running
         model forward passes for uncached chunks, updating page hashes as pages become complete, and stashing
         recurrent checkpoints when applicable. It emits progress events but does not sample new completion tokens.
+
+        chunk_size, when given, bounds the forward pass of this call below the generator's max_chunk_size (prompt
+        ingestion alongside generating jobs). The cached-page skip still covers the full max_chunk_size window.
         """
 
         if self.time_first_prefill is None:
@@ -1395,6 +1444,11 @@ class Job:
                 if page.kv_position == PAGE_SIZE:
                     prefill_end = local_idx * PAGE_SIZE
                     break
+
+            # A reduced chunk bounds the forward pass only, after the cached pages were skipped over the full
+            # window above, so a job resuming a cached prompt still walks it at the usual rate
+            if chunk_size is not None:
+                prefill_end = min(prefill_end, (prefill_start + chunk_size) // PAGE_SIZE * PAGE_SIZE)
 
             if prefill_end <= prefill_start:
                 continue
@@ -1525,19 +1579,23 @@ class Job:
                     "block_table": seq.block_index_tensor,
                     "cache": self.generator.cache,
                     "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
-                    "recurrent_states": [self.recurrent_state] if self.recurrent_state is not None else None,
+                    "recurrent_states": [self.recurrent_state.target] if self.recurrent_state is not None and
+                                        self.recurrent_state.target is not None else None,
                     "indexed_embeddings": self.embeddings,
                     "inv_freq": self.alt_rope_freqs,
                     "mm_span_prefix": mm_span_prefix,
                 }
                 if self.generator.draft_model:
                     params.update(self.generator.draft_model.draft_verifier_params)
-                if self.generator.mtp_draft:
+                dm = self.generator.draft_model
+                if self.generator.mtp_draft and not (dm is not None and dm.caps.get("draft_uses_target_cache")):
                     # MTP needs the target's post-final-norm state for every prompt token.
                     # Normal prefill stops at the last cache-writing layer, before final norm.
                     params["last_tokens_only"] = 1
                     self.generator.model.forward(input_ids = prefill_ids, params = params)
                 else:
+                    # (A drafter fed the last decoder layer's output takes the regular prefill, which runs
+                    # through that layer)
                     self.generator.model.prefill(input_ids = prefill_ids, params = params)
 
                 if self.generator.dflash_draft:
@@ -1547,6 +1605,8 @@ class Job:
                         params = {
                             "block_table": seq.block_index_tensor,
                             "cache_seqlens": params["cache_seqlens"],
+                            "recurrent_states": [self.recurrent_state.draft] if self.recurrent_state is not None
+                                                and self.recurrent_state.draft is not None else None,
                         }
                     )
                 elif self.generator.draft_model:
@@ -1569,6 +1629,8 @@ class Job:
                             "cache": self.generator.draft_cache,
                             "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
                             "indexed_embeddings": self.embeddings if self.generator.mtp_draft else None,
+                            "recurrent_states": [self.recurrent_state.draft] if self.recurrent_state is not None
+                                                and self.recurrent_state.draft is not None else None,
                         }
                     )
 
@@ -1577,7 +1639,7 @@ class Job:
                 # next chunk, so rewind to keep the state position in sync with kv_position. Re-fed
                 # tokens map to the same state slots with the same values, leaving state content intact.
                 if self.recurrent_state is not None and self.recurrent_state.position > prefill_end:
-                    self.recurrent_state.rewind(self.recurrent_state.position - prefill_end)
+                    self.recurrent_state.rewind_to(prefill_end)
 
                 seq.kv_position = prefill_end
 
@@ -1658,9 +1720,9 @@ class Job:
             self.free_recurrent_state()
             if self.generator.recurrent_cache is not None:
                 if stashed_recurrent_state is None:
-                    self.recurrent_state = self.generator.cache.get_new_state()
+                    self.recurrent_state = self.generator.new_recurrent_state()
                 else:
-                    self.recurrent_state = self.generator.cache.new_from_stashed(
+                    self.recurrent_state = self.generator.recurrent_state_from_stashed(
                         stashed_recurrent_state,
                         position = cached_pages * PAGE_SIZE,
                     )
@@ -1715,20 +1777,28 @@ class Job:
         """
         Return whether the current sequence position should stash a recurrent checkpoint.
 
-        Checkpoints are measured from the end of the cached K/V prefix so restored pages and recurrent state stay in
-        sync. An explicit interval overrides the normal policy; otherwise prefill uses the coarser prompt-prefill
-        interval until it nears the generation boundary, where it switches to the normal recurrent checkpoint
-        interval.
+        Checkpoints sit on page boundaries, spaced at least the checkpoint interval apart: a position qualifies
+        once it is the interval or more past the previous checkpoint, or past the end of the cached K/V prefix
+        (which a restored state matches) while there is none. Positions are not required to fall on a fixed grid,
+        so prefill chunks may vary in size. An explicit interval overrides the normal policy; otherwise prefill
+        uses the coarser prompt-ingestion interval until it nears the generation boundary, where it switches to
+        the normal recurrent checkpoint interval.
         """
         seq = self.sequences[0]
-        prompt_len = len(seq.sequence_ids) - 1
         seq_pos = seq.kv_position
+        if seq_pos % PAGE_SIZE:
+            return False
         if override_interval:
             return seq_pos % override_interval == 0
-        elif seq_pos >= prompt_len - self.generator.max_chunk_size * 2:
-            return (seq_pos - self.cached_pages * PAGE_SIZE) % self.generator.recurrent_checkpoint_interval == 0
+        prompt_len = len(seq.sequence_ids) - 1
+        if seq_pos >= prompt_len - self.generator.max_chunk_size * 2:
+            interval = self.generator.recurrent_checkpoint_interval
         else:
-            return (seq_pos - self.cached_pages * PAGE_SIZE) % self.generator.recurrent_checkpoint_interval_pp == 0
+            interval = self.generator.recurrent_checkpoint_interval_pp
+        anchor = self.last_recurrent_checkpoint_pos
+        if anchor is None:
+            anchor = self.cached_pages * PAGE_SIZE
+        return seq_pos - anchor >= interval
 
 
     def mm_exact_spans(self, seq):
@@ -1792,6 +1862,40 @@ class Job:
             self.recurrent_state = None
 
 
+    def suffix_match(self, seq: torch.Tensor):
+        """(begin, end) of the earlier occurrence of the longest suffix of seq found by the job's suffix
+        automaton; end - begin is the match length. The automaton only accepts new tokens, so a second query
+        over the same sequence in one round (n-gram draft, then hybrid draft) reuses the first answer"""
+        n = seq.shape[-1]
+        if self.sam_match is not None and self.sam_match[0] == n:
+            return self.sam_match[1], self.sam_match[2]
+        beg, end = self.sam.accept_tensor(seq)
+        self.sam_match = (n, beg, end)
+        return beg, end
+
+
+    def get_hybrid_draft(self, length: int):
+        """
+        Continuation of the longest suffix match for the hybrid draft: (tokens, match length), with up to
+        `length` tokens following the earlier occurrence of the match. The caller decides whether the match
+        is long enough.
+        """
+        assert self.sam
+        seq = self.sequences[0].sequence_ids.torch()
+        beg, end = self.suffix_match(seq)
+        if end <= beg:
+            return torch.empty((1, 0), dtype = torch.long), 0
+        # The match sits `lag` tokens behind the present, so the continuation in the buffer is at most that
+        # long. A match longer than its lag means the sequence is periodic over it ("A B C A B C A B"), and the
+        # same rule that found it (x[n] = x[n - lag]) extends the continuation past the buffer by repeating
+        # the lag window; a match against distant context has a lag beyond `length` and tiles nothing
+        cont = seq[:, end:]
+        lag = cont.shape[-1]
+        if lag < length:
+            cont = cont.repeat(1, -(-length // lag))
+        return cont[:, :length], end - beg
+
+
     def get_ngram_draft(self, draft_length: int):
         """
         Return the continuation of the longest live/corpus suffix match.
@@ -1800,7 +1904,7 @@ class Job:
 
         # Update SAM with current history and find longest suffix
         seq = self.sequences[0].sequence_ids.torch()
-        beg, end = self.sam.accept_tensor(seq)
+        beg, end = self.suffix_match(seq)
 
         # Grab continuation after longest match or return empty seq
         if end - beg >= self.generator.ngram_match_min:

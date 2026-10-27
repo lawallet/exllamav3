@@ -134,6 +134,7 @@ def profile(context, path):
 
 def snapshot(context, cache_id, batch, position, slots, step_ends):
     """Hash initialized rank-local KV rows and live recurrent state, outside timing."""
+    from exllamav3.modules.gated_delta_net import GDNLayerState
     tensors = {}
     pages_per_sequence = 65536 // batch // 256
     for m in context['kv_modules']:
@@ -158,7 +159,7 @@ def snapshot(context, cache_id, batch, position, slots, step_ends):
         if hasattr(layer, 'ring'):
             # DSV4 TP does not clear unused capacity on every slot acquisition.
             # Match the existing DeepSeek oracle's logical live-state slices.
-            for b, (slot, window_beg) in enumerate(slots):
+            for b, (slot, window_beg, base_row) in enumerate(slots):
                 tensors[f'{m.key}:ring:{b}'] = digest(layer.ring[slot, :position-window_beg])
                 for name in ('comp_buf_kv','comp_buf_gate','idx_buf_kv','idx_buf_gate'):
                     t = getattr(layer, name, None)
@@ -179,8 +180,12 @@ def snapshot(context, cache_id, batch, position, slots, step_ends):
             continue
         values = layer.get_state_tensors() if hasattr(layer, 'get_state_tensors') else layer._tensors()
         for i, tensor in enumerate(values):
-            for b, (slot, window_beg) in enumerate(slots):
-                live = tensor[slot]
+            for b, (slot, window_beg, base_row) in enumerate(slots):
+                # v1.6.5 has two GDN scan rows per slot; only the committed
+                # parity row is live. Conv rings and other cache families are
+                # still indexed by the sequence slot.
+                row = base_row if isinstance(layer, GDNLayerState) and i == 1 else slot
+                live = tensor[row]
                 if hasattr(layer, 'k_state'):
                     live = live[:position-window_beg]
                 tensors[f'{m.key}:recurrent:{i}:{b}'] = digest(live)
@@ -193,6 +198,8 @@ def main():
     p.add_argument('--extension-dir', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--single', action='store_true')
+    p.add_argument('--single-parity', action='store_true',
+                   help='also compare stock with IR on the single-device path')
     p.add_argument('--allow-host-ngram-baseline', action='store_true',
                    help='measure Qwen single-GPU using its unchanged, existing host ngram table')
     p.add_argument('--context', type=int, default=256)
@@ -355,7 +362,10 @@ def main():
         memory_event('loaded and warmed')
     def set_mode(enabled, trace=False, reset=True):
         if a.single:
+            from exllamav3.modules import transformer
             native_plan.enabled = enabled
+            transformer._native_qwen_enabled = enabled and cfg.arch_string == 'Qwen4ExpForConditionalGeneration'
+            transformer._native_glm_enabled = enabled and cfg.arch_string == 'Glm5NextForConditionalGeneration'
             if reset:
                 single_counts.update(executions=0, builds=0)
         else:
@@ -458,7 +468,9 @@ def main():
             evidence = reports()
             state = None
             if not timed and not a.single:
-                slots = [(s.slot, getattr(s, 'window_beg', 0)) for s in states] if states else []
+                slots = [(s.slot, getattr(s, 'window_beg', 0),
+                          s.base_row() if hasattr(s, 'base_row') else s.slot)
+                         for s in states] if states else []
                 state = model.tp_worker_dispatch_wait_multi(model.active_devices, snapshot, (id(cache), batch, past, slots, step_ends))
             if enabled and not a.single:
                 assert len(evidence) == torch.cuda.device_count(), evidence
@@ -530,9 +542,17 @@ def main():
                     if query > 1 and batch > 1:
                         continue  # Multi-row verification is separately exercised by the generator.
                     if a.single:
+                        stock = run(False, batch, query) if a.single_parity else None
                         ref, ref_logits, ref_pre = run(True, batch, query)
                         torch.save(dict(logits=ref_logits, prefill=ref_pre), a.output/f'logits-{cycle}-{batch}-{query}.pt')
                         result = dict(cycle=cycle, batch=batch, query=query, single=ref)
+                        if stock is not None:
+                            stock_run, stock_logits, stock_pre = stock
+                            result.update(reference=stock_run,
+                                exact=all(torch.equal(x,y) for x,y in zip(stock_logits,ref_logits)),
+                                prefill_exact=torch.equal(stock_pre,ref_pre))
+                            save(f'parity-{cycle}-{batch}-{query}.json', result)
+                            assert result['exact'] and result['prefill_exact'], 'Single-device stock/IR mismatch'
                     else:
                         ref, ref_logits, ref_pre = run(False, batch, query)
                         three = torch.cuda.device_count() > 2
@@ -571,7 +591,7 @@ def main():
             if cycle == 0:
                 timings = []
                 for pair in range(a.runs):
-                    for enabled in ([True] if a.single else ([False,True] if pair%2==0 else [True,False])):
+                    for enabled in ([True] if a.single and not a.single_parity else ([False,True] if pair%2==0 else [True,False])):
                         measured, _, _ = run(enabled, 1, 1, timed=True,
                                              forced=timings[0]['generated'] if timings and not a.single and torch.cuda.device_count()>2 else None)
                         timings.append(dict(pair=pair, native=enabled, **measured))
@@ -581,11 +601,11 @@ def main():
                         print('TIMING', pair, enabled, measured['tokens_per_second'], flush=True)
             if a.generator or a.mtp:
                 for count in a.batches:
-                    reference = generator_run(True if a.single else False, count)
+                    reference = generator_run(a.single and not a.single_parity, count)
                     candidate = generator_run(True, count)
                     exact = all(reference[k] == candidate[k] for k in ('completions', 'logits', 'summaries'))
                     save(f'generator-{cycle}-{count}.json', dict(reference=reference, native=candidate, exact=exact,
-                                                                reference_native=a.single))
+                                                                reference_native=a.single and not a.single_parity))
                     if not a.single and torch.cuda.device_count() > 2:
                         assert candidate['fallback_only'] or all(r['shadow_checks'] > 0 for r in candidate['evidence']), 'No exact local generator checks'
                     else:

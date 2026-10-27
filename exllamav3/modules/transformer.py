@@ -4,13 +4,24 @@ import torch
 from ..util.tensor import to2
 from ..model.config import Config
 from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, MLP, BlockSparseMLP, Linear
-from .hyperconnections import HyperConnection
+from .hyperconnections import HyperConnection, hc_flush
 from ..util import profile_opt
 import os
 from . import native_plan
 
 _native_qwen_enabled = os.environ.get('EXL3_NATIVE_QWEN_BLOCK', '0') == '1'
 _native_glm_enabled = os.environ.get('EXL3_NATIVE_GLM_BLOCK', '0') == '1'
+
+
+def _flush_native_input(x, params):
+    # Upstream may defer a stock predecessor's final residual update. Native
+    # plans consume materialized streams and do not participate in those folds.
+    pending = params.pop("resid_pending", None)
+    if pending is not None:
+        x += pending
+    if "hc_pending" in params:
+        hc_flush(params)
+
 
 class TransformerBlock(Module):
     _native_tp_kind = None
@@ -166,6 +177,13 @@ class TransformerBlock(Module):
         )
 
     @override
+    def prepare_for_device(self, x: torch.Tensor, params: dict) -> torch.Tensor:
+        # A deferred mHC apply_ (hyperconnections.hc_flush) lands before its streams move to another device
+        if "hc_pending" in params and x.device != self.device:
+            hc_flush(params)
+        return super().prepare_for_device(x, params)
+
+    @override
     def forward(
         self,
         x: torch.Tensor,
@@ -178,6 +196,7 @@ class TransformerBlock(Module):
             from .native_qwen import get_native_block
             native = get_native_block(self, x, params)
             if native is not None:
+                _flush_native_input(x, params)
                 # Native mixes weight streams inside the kernel. Consume the
                 # stock predecessor's copy before mutating the same residual.
                 params.pop('gr_weighted', None)
@@ -190,6 +209,7 @@ class TransformerBlock(Module):
             from .native_glm import get_native_block
             native = get_native_block(self, x, params)
             if native is not None:
+                _flush_native_input(x, params)
                 y = self.attn.forward(native.begin(x), params)
                 y = self.mlp.forward(native.middle(x, y), params)
                 native.finish(x, y)
@@ -201,6 +221,7 @@ class TransformerBlock(Module):
         if native_plan.enabled and self._native_plan_get is not None:
             native = self._native_plan_get(self, x, params)
             if native is not None:
+                _flush_native_input(x, params)
                 if self._native_tp_kind == 'qwen':
                     params.pop('gr_weighted', None)
                 y = self.attn.forward(native.begin(x), params)
@@ -224,12 +245,24 @@ class TransformerBlock(Module):
 
         y_resid = None  # pending attn output whose residual add is folded into the MLP input norm
 
+        # Previous block's MLP output whose residual add is folded into this block's input norm (forward_ls sets
+        # resid_defer when the next module is a TransformerBlock on the same device)
+        pending = params.pop("resid_pending", None)
+        fuse_in = (
+            pending is not None and self.attn is not None and not self.attn_hc and
+            isinstance(self.attn_norm, RMSNorm) and self.attn_norm.can_fuse_residual(x, pending)
+        )
+        if pending is not None and not fuse_in:
+            x += pending
+
         if self.attn:
             if self.attn_hc:
-                hc_post, hc_comb, y = self.attn_hc.mix(x, params)
+                hc_post, hc_comb, y, normed = self.attn_hc.mix_norm(x, params, self.attn_norm)
                 y = y.half()
-                if self.attn_norm:
+                if self.attn_norm and not normed:
                     y = self.attn_norm.forward(y, params, out_dtype = torch.half)
+            elif fuse_in:
+                y = self.attn_norm.forward(pending, params, out_dtype = torch.half, residual_in = x)
             elif self.attn_norm:
                 y = self.attn_norm.forward(x, params, out_dtype = torch.half)
             else:
@@ -250,9 +283,9 @@ class TransformerBlock(Module):
 
         if self.mlp:
             if self.mlp_hc:
-                hc_post, hc_comb, y = self.mlp_hc.mix(x, params)
+                hc_post, hc_comb, y, normed = self.mlp_hc.mix_norm(x, params, self.mlp_norm)
                 y = y.half()
-                if self.mlp_norm:
+                if self.mlp_norm and not normed:
                     y = self.mlp_norm.forward(y, params, out_dtype = torch.half)
             else:
                 params["residual"] = x
@@ -269,6 +302,12 @@ class TransformerBlock(Module):
                 x = self.mlp_hc.apply_(x, y, hc_post, hc_comb, params)
             elif self.mlp_post_norm:
                 self.mlp_post_norm.forward(y, params, residual = x)
+            elif (
+                params.get("resid_defer") and not export_state and self.layer_scalar_f is None and
+                (out_dtype or self.out_dtype) in (None, x.dtype)
+            ):
+                params["resid_pending"] = y
+                return x
             else:
                 x += y
 
