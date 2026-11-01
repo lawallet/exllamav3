@@ -18,6 +18,7 @@ from .block_sparse_mlp_cpu import BlockSparseMLP_CPU
 from .moe_batch_recon import PAD_MAX, worst_case_bytes
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
+from . import native_moe
 from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
 from .block_sparse_mlp_routing import (
     RoutingCFG, ROUTING_ACT_SIGMOID, ROUTING_ACT_SQRTSP,
@@ -1019,6 +1020,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
     @override
     def unload(self):
+        native_moe.clear(self)
         self.cpu_unload()
         self.bc = None
         self.fused_mode_buffers = None
@@ -1144,6 +1146,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # Empty slice
         elif self.intermediate_size == 0 or self.num_local_experts == 0:
             final_hidden_states = torch.zeros(eshape, dtype = torch.float, device = y.device)
+
+        # Optional bounded native IR stage; unsupported cases retain stock execution.
+        elif native_moe.enabled and (ir_result := native_moe.run(self, y, selected_experts, routing_weights, params)) is not None:
+            final_hidden_states = ir_result.view(eshape)
 
         # Torch/C++/fused path
         elif (

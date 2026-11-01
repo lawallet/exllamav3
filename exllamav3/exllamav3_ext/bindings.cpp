@@ -69,6 +69,7 @@
 #include "libtorch/qwen_block.h"
 #include "libtorch/block_plan.h"
 #include "libtorch/block_plan_v2.h"
+#include "libtorch/native_moe_assignment.h"
 #include "libtorch/dsv4_compressor.h"
 #include "libtorch/dsv4_attn.h"
 #include "dsv4_compress.cuh"
@@ -333,6 +334,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/gated_rmsnorm_bc.h"
     #include "libtorch/mlp_bc.h"
     #include "libtorch/blocksparse_mlp_bc.h"
+    m.attr("native_moe_assignment_abi") = 1;
+    m.def("native_moe_assign", &native_moe_assign);
     m.attr("native_block_plan_v2_abi") = 1;
     m.attr("native_block_plan_v2_residual_ops") = 1;
     py::class_<BC_BlockPlanV2>(m, "BC_BlockPlanV2")
