@@ -15,6 +15,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 
+def isolate_triton_cache(context, root):
+    """Keep validation ranks from replacing each other's Windows cache files."""
+    from triton import knobs
+    path = Path(root) / f"rank-{context['rank']}"
+    path.mkdir(parents=True, exist_ok=True)
+    knobs.cache.dir = str(path)
+    return str(path)
+
+
 def digest(t):
     import torch
     return hashlib.sha256(t.detach().contiguous().cpu().view(torch.uint8).numpy().tobytes()).hexdigest()
@@ -209,6 +218,7 @@ def main():
     p.add_argument('--queries', type=int, nargs='+', default=[1])
     p.add_argument('--runs', type=int, default=3)
     p.add_argument('--reload', action='store_true')
+    p.add_argument('--triton-cache-root', help='optional validation-only cache directory per TP rank')
     p.add_argument('--profile', action='store_true', help='profile timed regions; reported timings are instrumented')
     p.add_argument('--generator', action='store_true', help='also test concurrent generation and prompt-cache reuse')
     p.add_argument('--mtp', action='store_true', help='attach the existing single-device MTP draft for generator tests')
@@ -324,6 +334,10 @@ def main():
                                                distributed_tensor_modules=distributed))
         if draft is not None:
             draft.attach_to(model)
+        if a.triton_cache_root and model.loaded_tp:
+            paths = model.tp_worker_dispatch_wait_multi(model.active_devices, isolate_triton_cache,
+                (str(Path(a.triton_cache_root).resolve()),))
+            save('rank-triton-caches.json', paths)
         print('WARMUP', cfg.arch_string, flush=True)
         # A cold rank can spend minutes compiling while the other finishes.
         # Extend only the harness's host RPC wait during upstream null-backend

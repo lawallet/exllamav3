@@ -78,6 +78,11 @@ class TestGuard(unittest.TestCase):
             with self.subTest(k=k):
                 self.assertIsNone(self.get(**{k: value}))
 
+    def test_carried_pre_rejects_cached_plan(self):
+        self.assertIsNotNone(self.get())
+        self.block.attn_hc.carry_pre = True
+        self.assertIsNone(self.get())
+
     def test_norm_change_invalidates(self):
         self.get()
         self.block.attn_norm.constant_scale = 2

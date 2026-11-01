@@ -19,6 +19,16 @@ class Owner:
 
 
 class TestHCNormContract(unittest.TestCase):
+    def test_carried_pre_rejects_before_cache_lookup(self):
+        h = native_tp.HyperConnection.__new__(native_tp.HyperConnection)
+        h.carry_pre = True
+        block = NS(_native_tp_kind='deepseek', attn_hc=h, mlp_hc=h,
+                   attn_norm=None, mlp_norm=None)
+        reasons = []
+        with patch.object(native_tp, '_lookup', side_effect=AssertionError('cache used')):
+            self.assertIsNone(native_tp._streams(block, torch.empty(1,1,4,4096), reasons.append))
+        self.assertEqual(reasons, ['carried HC pre weights require stock execution'])
+
     def test_norm_dtypes_and_layout(self):
         n = native_tp.RMSNorm.__new__(native_tp.RMSNorm)
         n.groups, n.span_heads, n.unweighted = 1, False, False
@@ -69,6 +79,13 @@ class TestRegistration(unittest.TestCase):
     def test_unknown_registration_fails(self):
         with self.assertRaisesRegex(ValueError, 'Unknown native TP'):
             native_tp.bind(NS(), 'new_architecture', {})
+
+    def test_carried_pre_not_exported(self):
+        from exllamav3.modules.native_deepseek import get_native_block
+        owner = Owner()
+        block = NS(_native_plan_owner=weakref.ref(owner), _native_plan_get=get_native_block,
+                   attn_hc=NS(carry_pre=True))
+        self.assertIsNone(native_tp.export_kind(block))
 
     def test_laguna_excluded_without_changing_single_gpu_registration(self):
         from exllamav3.modules.native_laguna import get_native_block

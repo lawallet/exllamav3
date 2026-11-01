@@ -35,6 +35,9 @@ def _hc_plan(sites, batch, query, *, kind):
 
 
 def export_kind(block):
+    if any(getattr(getattr(block, name, None), 'carry_pre', False)
+           for name in ('attn_hc', 'mlp_hc')):
+        return None
     for attr, kind in (('_native_qwen_owner', 'qwen'), ('_native_glm_owner', 'glm'),
                        ('_native_plan_owner', None)):
         ref = getattr(block, attr, None)
@@ -248,6 +251,8 @@ def _streams(block, x, reject):
             return reject('HC residual geometry')
         if any(type(h) is not HyperConnection for h, _ in sites):
             return reject('HC operands')
+        if any(getattr(h, 'carry_pre', False) for h, _ in sites):
+            return reject('carried HC pre weights require stock execution')
         def signature_for_sites():
             return tuple((_tensor_key(h.fn), _tensor_key(h.fn_h), _tensor_key(h.base),
                           _tensor_key(h.scale), _norm_key(n), h.rms_eps, h.hc_eps,

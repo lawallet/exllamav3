@@ -145,6 +145,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--model', required=True)
     p.add_argument('--extension-dir', type=Path, required=True)
+    p.add_argument('--package-root', type=Path, help='Explicit installed/extracted package root; defaults to checkout')
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--lengths', type=int, nargs='+', default=[128, 1024, 2048, 4096, 8192])
     p.add_argument('--runs', type=int, default=3)
@@ -169,6 +170,9 @@ def main():
     if min(a.lengths) < 1 or longest + 1024 > 65536 // a.batch:
         p.error('invalid lengths for shared 65536-token cache')
     sys.path.insert(1, str(a.extension_dir.resolve()))
+    package_root = a.package_root.resolve() if a.package_root else ROOT
+    if a.package_root:
+        sys.path.insert(0, str(package_root))
     os.environ.update(EXL3_NATIVE_PLAN='1', EXL3_NATIVE_QWEN_BLOCK='1', EXL3_NATIVE_GLM_BLOCK='1')
     import torch
     import exllamav3
@@ -176,7 +180,7 @@ def main():
     from exllamav3.ext import exllamav3_ext as ext
     from exllamav3.modules import native_plan
     torch.set_grad_enabled(False)
-    assert Path(exllamav3.__file__).parent == ROOT / 'exllamav3'
+    assert Path(exllamav3.__file__).parent.resolve() == package_root / 'exllamav3'
     assert Path(ext.__file__).parent.resolve() == a.extension_dir.resolve()
     if 'graphs' in a.modes:
         assert not a.single and hasattr(ext.BC_BlockPlan, 'set_graphs'), 'Graphs require the experimental TP extension'
@@ -207,8 +211,8 @@ def main():
         (a.output / name).write_text(json.dumps(value, indent=2, default=str), encoding='utf-8')
 
     def hashes():
-        return {str(f.relative_to(ROOT)): hashlib.sha256(f.read_bytes()).hexdigest()
-                for f in (ROOT / 'exllamav3').rglob('*.py')}
+        return {str(f.relative_to(package_root)): hashlib.sha256(f.read_bytes()).hexdigest()
+                for f in (package_root / 'exllamav3').rglob('*.py')}
 
     initial = hashes()
     save('source-hashes.json', initial)

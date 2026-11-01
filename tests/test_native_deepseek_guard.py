@@ -85,6 +85,25 @@ class TestDeepseek(unittest.TestCase):
         with patch.object(native_plan,'available',False): self.assertIsNone(self.get())
         with patch.object(native_plan,'enabled',False): self.assertIsNone(self.get())
 
+    def test_carried_pre_rejects_before_cached_plan(self):
+        self.assertIsNotNone(self.get())
+        calls = self.constructor.call_count
+        for site in (self.block.attn_hc, self.block.mlp_hc):
+            site.carry_pre = True
+            self.assertIsNone(self.get())
+            site.carry_pre = False
+        self.assertEqual(self.constructor.call_count, calls)
+
+    def test_carried_pre_is_not_registered(self):
+        from exllamav3.modules import TransformerBlock
+        ordinary = TransformerBlock(None, 'ordinary', layer_idx=0)
+        carried = TransformerBlock(None, 'carried', layer_idx=1)
+        carried.attn_hc = NS(carry_pre=True)
+        self.owner.modules = [ordinary, carried]
+        n.register(self.owner)
+        self.assertIs(ordinary._native_plan_get, n.get_native_block)
+        self.assertIsNone(carried._native_plan_get)
+
     def test_invalidation_and_bad_norm(self):
         self.get()
         self.block.attn_norm.weight=Tensor((4096,),self.x.device).half()

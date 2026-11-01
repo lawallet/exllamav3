@@ -48,7 +48,8 @@ def eligible(m, y, selected, weights, params):
     from .block_sparse_mlp import FUSED_DET
     if not FUSED_DET or any(k in params for k in (
         "backend", "tp_warmup", "autosplit_measure", "activate_all_experts",
-        "capture_qmaps", "capture_sens", "capture_h", "calibration", "reconstruct")):
+        "capture_qmaps", "capture_sens", "capture_h", "calibration", "reconstruct",
+        "capture", "capture_only", "quant_preserve", "moe_affinity")):
         return False
     if (y.dtype != torch.half or not y.is_cuda or not y.is_contiguous()
         or selected.shape != (y.shape[0], 22) or weights.shape != selected.shape

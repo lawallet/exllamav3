@@ -46,6 +46,8 @@ def get_native_block(block, x, params):
            n.weight.dtype not in (torch.float16, torch.bfloat16) or
            n.weight.device != x.device or not n.weight.is_contiguous() for n in (an, mn)):
         return None
+    if any(getattr(h, 'carry_pre', False) for h in (a, m)):
+        return None
     signature = tuple(id(t) for h, n in ((a, an), (m, mn)) for t in (h.fn, h.fn_h, h.base, h.scale, n.weight))
     signature += tuple(v for h, n in ((a, an), (m, mn)) for v in
         (h.hc_mult, h.hidden_size, h.sinkhorn_iters, h.hc_eps, h.rms_eps,

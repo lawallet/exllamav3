@@ -12,7 +12,7 @@ from exllamav3.modules.transformer import TransformerBlock
 class TestDeferredNativeInput(unittest.TestCase):
     def block(self):
         b = TransformerBlock(None, 'block', layer_idx=0)
-        b.attn = NS(forward=lambda x, p: torch.ones_like(x))
+        b.attn = NS(device=b.device, forward=lambda x, p: torch.ones_like(x))
         b.mlp = NS(forward=lambda x, p: torch.full_like(x, 2))
         return b
 

@@ -49,6 +49,9 @@ class TestMTPGuard(unittest.TestCase):
     def test_norm_dtype_and_shape_checked_before_cached_plan(self):
         TestGuard.test_norm_dtype_and_shape_checked_before_cached_plan(self)
 
+    def test_carried_pre_rejects_cached_plan(self):
+        TestGuard.test_carried_pre_rejects_cached_plan(self)
+
     def test_wrong_attachment(self):
         self.draft.attached_model=lambda:None
         self.assertIsNone(self.get())

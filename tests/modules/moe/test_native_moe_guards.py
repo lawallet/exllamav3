@@ -43,7 +43,8 @@ def test_guards(device, monkeypatch):
         assert '_native_moe_stages' not in m.__dict__
         setattr(m,name,old)
     for key in ('backend','tp_warmup','autosplit_measure','activate_all_experts',
-                'capture_qmaps','capture_sens','capture_h','calibration'):
+                'capture_qmaps','capture_sens','capture_h','calibration',
+                'capture','capture_only','quant_preserve','moe_affinity'):
         assert not nm.eligible(m,y,sel,w,{key:False}), key
     for r in (1,4,8,9,13,17):
         assert not nm.eligible(m,torch.empty((r,1024),dtype=torch.half,device=device),sel,w,{})

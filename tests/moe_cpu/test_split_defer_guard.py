@@ -31,6 +31,8 @@ class _Sub:
     """Submodule stand-in recording whether the stc was deferring when it loaded"""
     def __init__(self, stc):
         self.stc = stc
+        self.device = None
+        self.caps = {}
         self.loaded_deferred = None
     def can_defer_load(self):
         return True

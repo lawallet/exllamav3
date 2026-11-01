@@ -11,7 +11,9 @@ def register(model):
     import weakref
     from .transformer import TransformerBlock
     for block in model.modules:
-        if type(block) is TransformerBlock:
+        if type(block) is TransformerBlock and not any(
+            getattr(h, 'carry_pre', False) for h in (block.attn_hc, block.mlp_hc)
+        ):
             block._native_plan_get = get_native_block
             block._native_plan_owner = weakref.ref(model)
 
@@ -42,6 +44,10 @@ def get_native_block(block, x, params):
     # slots, pools, verification and rewind, exactly as on the stock path.
     sites = ((block.attn_hc, block.attn_norm), (block.mlp_hc, block.mlp_norm))
     if any(type(h) is not HyperConnection or type(n) is not RMSNorm for h, n in sites):
+        return None
+    # V4.1 collapses with the previous site's weights; the existing IR encodes
+    # only same-site collapse. Check before looking up an already cached plan.
+    if any(getattr(h, 'carry_pre', False) for h, _ in sites):
         return None
     if any(m.device is None or torch.device(m.device) != x.device for m in
            (block, block.attn, block.mlp, *(m for site in sites for m in site))):
