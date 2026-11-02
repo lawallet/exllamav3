@@ -32,6 +32,8 @@ class DeepseekV41MTPModel(DeepseekV4MTPModel):
             **kwargs
         )
         self.draft_verifier_params["export_state_layers"] = {t - 1 for t in targets}
+        from ..modules.native_deepseek_v41 import register
+        register(self)
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:

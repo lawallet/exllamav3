@@ -103,3 +103,14 @@ def deepseek(sites, batch, query):
         [[(HC_MIX, 0), (RMS_NORM, 0)],
          [(APPLY, 0), (HC_MIX, 1), (RMS_NORM, 1)], [(APPLY, 1)]],
         [], None, batch, query)
+
+
+def deepseek_carry(sites, batch, query):
+    """Carried HC weights and FP32 collapse, around unchanged Python sublayers."""
+    return ext.BC_BlockPlan(
+        [[h.fn_h, h.base, h.scale, n.weight] for h, n in sites],
+        [6, 6], [h.rms_eps for h, _ in sites],
+        [h.hc_eps for h, _ in sites], [h.sinkhorn_iters for h, _ in sites],
+        [[(6, 0), (RMS_NORM, 0)],
+         [(APPLY, 0), (6, 1), (RMS_NORM, 1)], [(APPLY, 1)]],
+        [], None, batch, query)

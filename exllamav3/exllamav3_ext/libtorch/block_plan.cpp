@@ -26,7 +26,9 @@ BC_BlockPlan::BC_BlockPlan(std::vector<std::vector<at::Tensor>> weights,
     for (size_t i=0; i<n; ++i) {
         auto& w = weights[i];
         TORCH_CHECK((kinds[i]==GR_MIX && w.size()==3 && rows<=5) ||
-                    (kinds[i]==HC_MIX && w.size()==4), "Block plan: invalid mix bundle");
+                    ((kinds[i]==HC_MIX || kinds[i]==HC_CARRY) && w.size()==4), "Block plan: invalid mix bundle");
+        TORCH_CHECK(i==0 || (kinds[i]==HC_CARRY)==carry_mode, "Block plan: mixed carry semantics");
+        if (i==0) carry_mode=kinds[i]==HC_CARRY;
         for (const auto& t : w)
             TORCH_CHECK(t.defined() && t.device()==device && t.is_contiguous(),
                         "Block plan: invalid tensor placement/layout");
@@ -40,8 +42,8 @@ BC_BlockPlan::BC_BlockPlan(std::vector<std::vector<at::Tensor>> weights,
                 w[0].size(0)==w[1].size(2)+h && w[0].size(1)==h*d &&
                 w[2].numel()==h*d, "Block plan: inconsistent gated mix dimensions");
         } else {
-            h=4; d=4096;
-            TORCH_CHECK(w[0].scalar_type()==at::kHalf && w[0].sizes()==at::IntArrayRef({24,16384}) &&
+            h=4; d=carry_mode ? 5120 : 4096;
+            TORCH_CHECK(w[0].scalar_type()==at::kHalf && w[0].sizes()==at::IntArrayRef({24,h*d}) &&
                 w[1].scalar_type()==at::kFloat && w[1].numel()==24 &&
                 w[2].scalar_type()==at::kFloat && w[2].numel()==3, "Block plan: invalid HC weights");
             TORCH_CHECK(w[3].sizes()==at::IntArrayRef({d}) &&
@@ -53,14 +55,15 @@ BC_BlockPlan::BC_BlockPlan(std::vector<std::vector<at::Tensor>> weights,
         Site s; s.w=std::move(w); s.eps=eps[i]; s.hc_eps=hc_eps[i]; s.iterations=iterations[i];
         auto opts=s.w[0].options().dtype(at::kFloat);
         s.post=at::empty({rows,h},opts);
-        s.mixed=at::empty({rows,d},opts.dtype(at::kHalf));
+        s.mixed=at::empty({rows,d},opts.dtype(carry_mode ? at::kFloat : at::kHalf));
         if (kinds[i]==GR_MIX) {
             s.dots=at::empty({rows,s.w[0].size(0)+1,h},opts);
             s.output=s.mixed.view({b,q,d});
         } else {
             s.dots=at::empty({rows,hc_mix_num_chunks(rows,h*d),25},opts);
             s.comb=at::empty({rows,h,h},opts);
-            s.normalized=at::empty_like(s.mixed);
+            s.normalized=at::empty({rows,d},opts.dtype(at::kHalf));
+            if (carry_mode) s.pre=at::empty({rows,h},opts);
             s.output=s.normalized.view({b,q,d});
         }
         sites.push_back(std::move(s));
@@ -75,7 +78,7 @@ BC_BlockPlan::BC_BlockPlan(std::vector<std::vector<at::Tensor>> weights,
             router[i]=at::empty({rows,router[i].size(1)},router[i].options());
     }
     const Kernel kernels[]={&BC_BlockPlan::gr,&BC_BlockPlan::hc,&BC_BlockPlan::apply,
-        &BC_BlockPlan::norm,&BC_BlockPlan::route,&BC_BlockPlan::experts};
+        &BC_BlockPlan::norm,&BC_BlockPlan::route,&BC_BlockPlan::experts,&BC_BlockPlan::hc_carry};
     std::vector<bool> mixed(n,false), applied(n,false);
     bool routed=false, value=false;
     for (size_t stage=0;stage<3;++stage) {
@@ -86,15 +89,15 @@ BC_BlockPlan::BC_BlockPlan(std::vector<std::vector<at::Tensor>> weights,
         }
         if (stage>0) value=true; // Explicit Python boundary supplies the current activation.
         for (auto [op,site]:code[stage]) {
-            TORCH_CHECK(op>=GR_MIX && op<=MOE && site>=0 && site<n, "Block plan: invalid instruction");
-            if (op==GR_MIX || op==HC_MIX) {
+            TORCH_CHECK(op>=GR_MIX && op<=HC_CARRY && site>=0 && site<n, "Block plan: invalid instruction");
+            if (op==GR_MIX || op==HC_MIX || op==HC_CARRY) {
                 TORCH_CHECK(op==kinds[site] && !mixed[site], "Block plan: invalid mix ordering");
                 mixed[site]=true; value=true;
             } else if (op==APPLY) {
                 TORCH_CHECK(mixed[site] && !applied[site] && value, "Block plan: apply without live gates");
                 applied[site]=true;
             } else if (op==RMS_NORM) {
-                TORCH_CHECK(kinds[site]==HC_MIX && mixed[site] && !applied[site], "Block plan: invalid norm");
+                TORCH_CHECK((kinds[site]==HC_MIX || kinds[site]==HC_CARRY) && mixed[site] && !applied[site], "Block plan: invalid norm");
             } else if (op==ROUTE) {
                 TORCH_CHECK(!router.empty() && value, "Block plan: route without activation"); routed=true;
             } else {
@@ -219,7 +222,17 @@ at::Tensor BC_BlockPlan::execute(size_t stage,const at::Tensor& x,at::Tensor y) 
     else for (const auto& op:stages[stage]) (this->*op.kernel)(sites[op.site],residual,y);
     return stage<2 ? sites[stages[stage].back().site].output : at::Tensor();
 }
-at::Tensor BC_BlockPlan::begin(const at::Tensor& x) { return execute(0,x,{}); }
+at::Tensor BC_BlockPlan::begin(const at::Tensor& x) {
+    TORCH_CHECK(!carry_mode, "Block plan: carry input must be explicit");
+    return execute(0,x,{});
+}
+at::Tensor BC_BlockPlan::begin_carry(const at::Tensor& x,const c10::optional<at::Tensor>& pre) {
+    TORCH_CHECK(carry_mode, "Block plan: not a carry plan");
+    if (pre.has_value()) TORCH_CHECK(pre->device()==x.device() && pre->scalar_type()==at::kFloat &&
+        pre->is_contiguous() && pre->sizes()==at::IntArrayRef({rows,channels}), "Block plan: invalid carried pre");
+    carry_output=pre.has_value() ? *pre : at::Tensor();
+    return execute(0,x,{});
+}
 at::Tensor BC_BlockPlan::middle(const at::Tensor& x,const at::Tensor& y) { return execute(1,x,y); }
 void BC_BlockPlan::finish(const at::Tensor& x,const at::Tensor& y) { execute(2,x,y); }
 void BC_BlockPlan::gr(Site& s,const at::Tensor& x,at::Tensor& y) {
@@ -227,6 +240,12 @@ void BC_BlockPlan::gr(Site& s,const at::Tensor& x,at::Tensor& y) {
 }
 void BC_BlockPlan::hc(Site& s,const at::Tensor& x,at::Tensor& y) {
     hc_mix(x,s.w[0],s.w[1],s.w[2],s.eps,s.hc_eps,s.iterations,s.dots,s.post,s.comb,s.mixed); y=s.mixed;
+}
+void BC_BlockPlan::hc_carry(Site& s,const at::Tensor& x,at::Tensor& y) {
+    const c10::optional<at::Tensor> pre=carry_output.defined() ? c10::optional<at::Tensor>(carry_output) : c10::nullopt;
+    hc_mix_carry(x,s.w[0],s.w[1],s.w[2],s.eps,s.hc_eps,s.iterations,
+                 s.dots,s.post,s.comb,s.mixed,pre,s.pre);
+    carry_output=s.pre; y=s.mixed;
 }
 void BC_BlockPlan::apply(Site& s,const at::Tensor& x,at::Tensor& y) {
     hc_apply(x,y,s.post,s.comb.defined() ? c10::optional<at::Tensor>(s.comb) : c10::nullopt,

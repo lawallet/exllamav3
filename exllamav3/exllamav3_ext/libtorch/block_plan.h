@@ -5,12 +5,12 @@
 
 // Row-local orchestration only. Python owns all persistent attention state.
 struct BC_BlockPlan {
-    enum Op { GR_MIX, HC_MIX, APPLY, RMS_NORM, ROUTE, MOE };
+    enum Op { GR_MIX, HC_MIX, APPLY, RMS_NORM, ROUTE, MOE, HC_CARRY };
     struct Site {
         std::vector<at::Tensor> w;
         double eps, hc_eps;
         int64_t iterations;
-        at::Tensor dots, post, comb, mixed, normalized, output;
+        at::Tensor dots, post, comb, mixed, normalized, output, pre;
     };
     using Kernel = void (BC_BlockPlan::*)(Site&, const at::Tensor&, at::Tensor&);
     struct Instruction { Kernel kernel; size_t site; };
@@ -19,6 +19,8 @@ struct BC_BlockPlan {
     std::vector<at::Tensor> router;
     std::shared_ptr<BC_BlockSparseMLP> moe;
     int64_t batch, query, rows, channels, hidden;
+    bool carry_mode = false;
+    at::Tensor carry_output;
     struct GraphBinding {
         at::Tensor tensor;
         void* pointer;
@@ -42,11 +44,13 @@ struct BC_BlockPlan {
     void set_graphs(bool enabled);
     void execute_graph(size_t stage, const at::Tensor& residual, at::Tensor y);
     at::Tensor begin(const at::Tensor& x);
+    at::Tensor begin_carry(const at::Tensor& x, const c10::optional<at::Tensor>& pre);
     at::Tensor middle(const at::Tensor& x, const at::Tensor& y);
     void finish(const at::Tensor& x, const at::Tensor& y);
     at::Tensor execute(size_t stage, const at::Tensor& x, at::Tensor y);
     void gr(Site&, const at::Tensor&, at::Tensor&);
     void hc(Site&, const at::Tensor&, at::Tensor&);
+    void hc_carry(Site&, const at::Tensor&, at::Tensor&);
     void apply(Site&, const at::Tensor&, at::Tensor&);
     void norm(Site&, const at::Tensor&, at::Tensor&);
     void route(Site&, const at::Tensor&, at::Tensor&);

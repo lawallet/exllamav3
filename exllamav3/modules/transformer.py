@@ -26,6 +26,7 @@ def _flush_native_input(x, params):
 
 class TransformerBlock(Module):
     _native_tp_kind = None
+    _native_carry_pre = False
 
     def __init__(
         self,
@@ -225,8 +226,21 @@ class TransformerBlock(Module):
                 _flush_native_input(x, params)
                 if self._native_tp_kind == 'qwen':
                     params.pop('gr_weighted', None)
-                y = self.attn.forward(native.begin(x), params)
+                if self._native_carry_pre:
+                    pre = params.get('hc_pre')
+                    pre = to_device(pre, x.device).reshape(-1, 4) if pre is not None else None
+                    y = native.begin_carry(x, pre)
+                    params['hc_pre'] = native.carry_output.view(*x.shape[:3])
+                else:
+                    y = native.begin(x)
+                if self._native_carry_pre and self.attn.device != self.device:
+                    y = self.attn.forward(self.attn.prepare_for_device(y, params), params)
+                    y = to_device(y, self.device)
+                else:
+                    y = self.attn.forward(y, params)
                 y = native.middle(x, y)
+                if self._native_carry_pre:
+                    params['hc_pre'] = native.carry_output.view(*x.shape[:3])
                 if x.ndim == 3:
                     params['residual'] = x
                 y = self.mlp.forward(y, params)

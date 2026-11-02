@@ -342,6 +342,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("native_moe_assign", &native_moe_assign);
     m.attr("native_block_plan_v2_abi") = 1;
     m.attr("native_block_plan_v2_residual_ops") = 1;
+    m.attr("native_block_plan_carry_abi") = 1;
     py::class_<BC_BlockPlanV2>(m, "BC_BlockPlanV2")
         .def(py::init<std::vector<std::pair<int64_t,int64_t>>, std::vector<at::Tensor>,
              std::vector<std::vector<double>>, std::vector<std::vector<std::vector<int64_t>>>,
@@ -355,6 +356,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
              std::vector<std::vector<std::pair<int64_t,int64_t>>>, std::vector<at::Tensor>,
              std::shared_ptr<BC_BlockSparseMLP>, int64_t, int64_t>())
         .def("begin", &BC_BlockPlan::begin)
+        .def("begin_carry", &BC_BlockPlan::begin_carry)
+        .def_readonly("carry_output", &BC_BlockPlan::carry_output)
         .def("middle", &BC_BlockPlan::middle)
         .def("finish", &BC_BlockPlan::finish)
         .def("set_graphs", &BC_BlockPlan::set_graphs)

@@ -141,6 +141,8 @@ class DeepseekV41Model(DeepseekV4Model):
         # reader finds its owner on its own rank (DSV4Attention.tp_import); the Engram layers are
         # replicated like the Qwen3.8 PLE layers
         self.caps.update({"supports_tp": True})
+        from ..modules.native_deepseek_v41 import register
+        register(self)
 
     @override
     def make_attn(self, idx: int, key: str, **extra):
