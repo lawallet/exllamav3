@@ -8,11 +8,15 @@ import statistics
 
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('directory',type=Path);a=p.parse_args()
-    result={'timings':{},'traces':{}}
+    p=argparse.ArgumentParser();p.add_argument('directory',type=Path)
+    p.add_argument('--skip-first',action='store_true',help='Treat round zero as context-specialization warmup')
+    a=p.parse_args()
+    result={'timings':{},'traces':{},'excluded_warmup':[]}
     groups=defaultdict(list)
     for path in a.directory.glob('c*-r*-mtp*-ir*.json'):
         if any(s in path.stem for s in ('profile','trace','audit')):continue
+        if a.skip_first and '-r0-' in path.stem:
+            result['excluded_warmup'].append(path.name);continue
         d=json.loads(path.read_text());jobs=d['result']['state']['jobs']
         if not jobs:continue
         j=jobs[0];key=path.stem.split('-r')[0]+'-'+path.stem.split('-mtp')[1]
@@ -54,8 +58,8 @@ def main():
             target_forwards=sum(e.get('cat')=='user_annotation' and e.get('name')=='ds41.Model.forward:text' for e in events),
             draft_forwards=sum(e.get('cat')=='user_annotation' and e.get('name')=='ds41.Model.forward:mtp' for e in events),
             host_annotation_ms={k:v/1000 for k,v in host.items()})
-    (a.directory/'summary.json').write_text(json.dumps(result,indent=2))
+    (a.directory/('summary-warmed.json' if a.skip_first else 'summary.json')).write_text(json.dumps(result,indent=2))
     print(json.dumps({k:{key:({kk:vv for kk,vv in val.items() if kk not in ('runs','host_annotation_ms')})
-                         for key,val in section.items()} for k,section in result.items()},indent=2))
+                         for key,val in section.items()} for k,section in result.items() if isinstance(section,dict)},indent=2))
 
 if __name__=='__main__':main()

@@ -6,6 +6,7 @@ admin key and reject changes while requests are active. No persistent config edi
 import cProfile
 import hashlib
 import importlib.metadata as md
+import importlib
 import json
 import os
 from pathlib import Path
@@ -35,9 +36,19 @@ if os.environ.get('DS41_EXTENSION_DIR'):
     assert Path(ext.__file__).parent == Path(os.environ['DS41_EXTENSION_DIR'])
 assert os.environ['CUDA_VISIBLE_DEVICES'] == '2,0,1'
 assert 'RTX PRO 6000' in torch.cuda.get_device_name(0)
-native_plan.enabled = False
+# Respect the normal environment-selected startup policy. Campaign controls may
+# subsequently toggle it for matched stock/native requests in this process.
 state = dict(jobs=[], name='startup', profile=False, audit=False)
 audit_saved=[]
+load_budgets=[]
+loader=importlib.import_module('exllamav3.model.model_ls')
+original_budget=loader.set_memory_fraction_use
+def record_budget(use,device):
+    current=torch.cuda.memory_reserved(device)
+    limit=original_budget(use,device)
+    load_budgets.append(dict(device=device,requested=use,reserved_before=current,limit=limit))
+    return limit
+loader.set_memory_fraction_use=record_budget
 
 def install_audit(c,enabled):
     for obj,name,original in reversed(audit_saved): setattr(obj,name,original)
@@ -164,7 +175,7 @@ def status():
         placement=[dict(key=m.key,device=str(m.device),attention=str(m.attn.device) if getattr(m,'attn',None) else None)
                    for m in mods], vision=bool(c and getattr(c,'vision_model',None)),
         active_tokens=[j.new_tokens for j in g.active_jobs] if g else [],
-        native_plans=len(plans),graph_captures=sum(p.graph_captures for p in plans),
+        load_budgets=load_budgets,native_plans=len(plans),graph_captures=sum(p.graph_captures for p in plans),
         graph_replays=sum(p.graph_replays for p in plans))
 
 original_iterate = Generator.iterate
@@ -174,8 +185,11 @@ def iterate(self, *args, **kwargs):
     if state.get('trace') and trace is None and generated >= 64: start_trace()
     if trace is not None and generated >= 96: stop_trace()
     if state['profile'] and profiler is None and generated >= 64:
-        profiler = cProfile.Profile(); profiler.enable()
-    results = original_iterate(self, *args, **kwargs)
+        profiler = cProfile.Profile()
+    # Balanced scopes preserve inclusive parent timings; enabling/disabling in
+    # an already-running iterate stack can corrupt cumulative frame accounting.
+    results = (profiler.runcall(original_iterate,self,*args,**kwargs) if profiler is not None
+               else original_iterate(self,*args,**kwargs))
     for r in results:
         if r.get('eos'):
             j = r['job']
@@ -185,7 +199,7 @@ def iterate(self, *args, **kwargs):
             record['memory'] = memory()
             state['jobs'].append(record)
             if profiler is not None:
-                profiler.disable(); profiler.dump_stats(str(OUT / (state['name']+'.prof')))
+                profiler.dump_stats(str(OUT / (state['name']+'.prof')))
                 profiler = None; state['profile'] = False
             if trace is not None: stop_trace()
     return results

@@ -28,6 +28,7 @@ def main():
     p.add_argument('--trace',action='store_true')
     p.add_argument('--audit',action='store_true')
     p.add_argument('--graphs',action='store_true')
+    p.add_argument('--startup-ir',action='store_true',help='Start with the normal EXL3_NATIVE_PLAN=1 policy')
     p.add_argument('--telemetry',action='store_true')
     p.add_argument('--package-root',type=Path)
     p.add_argument('--extension-dir',type=Path)
@@ -48,7 +49,7 @@ def main():
                 probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
                 probe.bind(('127.0.0.1',5008))
             env=dict(os.environ,CUDA_VISIBLE_DEVICES='2,0,1',EXL3_NGRAM_STREAM='1',
-                EXL3_NATIVE_PLAN='0',EXL3_NATIVE_MOE_ASSIGN='0',PYTHONPATH='',PYTHONDONTWRITEBYTECODE='1',DS41_RESULTS=str(out))
+                EXL3_NATIVE_PLAN=str(int(a.startup_ir)),EXL3_NATIVE_MOE_ASSIGN='0',PYTHONPATH='',PYTHONDONTWRITEBYTECODE='1',DS41_RESULTS=str(out))
             if a.package_root: env['DS41_PACKAGE_ROOT']=str(a.package_root.resolve())
             if a.extension_dir: env['DS41_EXTENSION_DIR']=str(a.extension_dir.resolve())
             cmd=[sys.executable,'-I',str(ROOT/'util/serve_deepseek_v41_ir.py'),

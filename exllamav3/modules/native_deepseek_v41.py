@@ -9,7 +9,9 @@ from .rmsnorm import RMSNorm
 
 available = getattr(native_plan.ext, 'native_block_plan_carry_abi', None) == 1
 graphs_available = getattr(native_plan.ext, 'native_block_plan_carry_graph_abi', None) == 1
-graphs_enabled = os.environ.get('EXL3_NATIVE_DSV41_GRAPHS', '0') == '1'
+# Validated for this carried-HC path only; older DeepSeek graph policy is unchanged.
+# EXL3_GRAPHS=0 remains the global opt-out in the shared graph implementation.
+graphs_enabled = os.environ.get('EXL3_NATIVE_DSV41_GRAPHS', '1') == '1'
 
 
 def register(model):
