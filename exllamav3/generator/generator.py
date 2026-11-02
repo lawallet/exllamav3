@@ -24,6 +24,7 @@ from .visualizer import CacheVisualizer
 import time
 from ..util.device_copy import to_device
 import threading
+from ..util.openmp import configure_openmp_for_current_thread
 from collections import deque
 from ..tokenizer import MMEmbedding
 from ..util import profile_opt
@@ -744,6 +745,7 @@ class Generator:
             }
         """
 
+        configure_openmp_for_current_thread()
         assert self.cache.initialized, \
             "Cache tensors were never allocated. Construct the Cache BEFORE calling model.load()"
         owner_serial = getattr(self.cache, "owner_serial", None)

@@ -10,6 +10,7 @@ from functools import lru_cache
 from .model_tp_backend import TPBackendNCCL, TPBackendNative, TPBackendNull
 from ..tokenizer.mm_embedding import recv_embeddings
 from ..util import log_tp, set_t0
+from ..util.openmp import configure_openmp_for_current_thread
 
 _no_fwd_barrier = os.environ.get("EXL3_TP_NO_FWD_BARRIER", "1") != "0"
 _stream_hash_passes = int(os.environ.get("EXL3_TP_STREAM_HASH", "0") or "0")
@@ -76,6 +77,7 @@ def mp_model_worker(
     producer: dict,
     dbg_t0_: float
 ):
+    configure_openmp_for_current_thread()
     # Terminal Ctrl-C is delivered to the whole foreground process group; shutdown is
     # orchestrated by the parent ("quit" command) or the kernel (PDEATHSIG), never by SIGINT
     signal.signal(signal.SIGINT, signal.SIG_IGN)

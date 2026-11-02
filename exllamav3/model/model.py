@@ -10,6 +10,7 @@ from .model_tp import Model_TPMixin
 from .model_ls import Model_LSMixin
 from ..util.tensor import g_tensor_cache
 from ..cache.recurrent_util import advance_recurrent_states
+from ..util.openmp import configure_openmp_for_current_thread
 
 class Model(Model_TPMixin, Model_LSMixin):
 
@@ -19,6 +20,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         **kwargs,
     ):
         super().__init__()
+        configure_openmp_for_current_thread()
         self.config = config
 
         self.modules = []
@@ -378,6 +380,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         and stops at the last module that affects K/V cache state. Otherwise the layer-split path prefill_ls() runs
         directly in the current process. Both paths advance recurrent states after the forward work completes.
         """
+        configure_openmp_for_current_thread()
         if params is None:
             params = {}
         x = self.prepare_inputs(input_ids, params)
@@ -446,6 +449,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         path forward_ls(). Recurrent state advancement is shared between the two modes and runs after the selected
         forward path returns.
         """
+        configure_openmp_for_current_thread()
         if params is None:
             params = {}
         x = self.prepare_inputs(input_ids, params)
@@ -603,6 +607,7 @@ class Model(Model_TPMixin, Model_LSMixin):
             attention input and output across. Default: the first device of the split
         """
 
+        configure_openmp_for_current_thread()
         if self.caps.get("load_with_target"):
             raise RuntimeError(
                 f"{self.config.architecture} loads with its target model: pass it as draft_model to the target's "
