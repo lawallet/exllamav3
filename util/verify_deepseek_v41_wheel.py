@@ -32,7 +32,8 @@ def main():
         metadata=z.read(next(n for n in z.namelist() if n.endswith('.dist-info/WHEEL'))).decode()
         assert 'Tag: cp313-cp313-win_amd64' in metadata
         assert 'Root-Is-Purelib: false' in metadata
-        version=z.read(next(n for n in z.namelist() if n.endswith('.dist-info/METADATA'))).decode().split('Version: ',1)[1].splitlines()[0]
+        package_metadata=z.read(next(n for n in z.namelist() if n.endswith('.dist-info/METADATA'))).decode()
+        version=next(line.removeprefix('Version: ') for line in package_metadata.splitlines() if line.startswith('Version: '))
         if a.installed:
             site=Path('D:/tabbyAPI/venv/Lib/site-packages')
             assert importlib.metadata.version('exllamav3')==version

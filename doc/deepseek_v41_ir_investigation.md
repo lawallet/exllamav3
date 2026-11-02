@@ -1,6 +1,9 @@
 # DeepSeek V4.1 native IR investigation
 
-Validation in progress; no release has been installed yet.
+The validated release wheel is installed in `D:/tabbyAPI/venv`. Installed MTP
+comparisons improve median decode throughput by 13.7% at 177 prompt tokens,
+16.5% at 8192 tokens and 13.9% at 64511 tokens, with exact paired outputs.
+Absolute throughput varies across processes; the detailed ranges below matter.
 
 ## Provenance
 
@@ -207,10 +210,10 @@ The graph candidate's completed `graph-http/timing` cohort has three warmed
 matching tokens within each MTP mode. Prompt occupancy is 177, cache capacity
 65536. MTP acceptance is 275/78 in every paired sample.
 
-| Mode | Stock median (range) tok/s | Native graphs median (range) tok/s | Median change |
-| --- | ---: | ---: | ---: |
-| MTP disabled | 10.743 (10.737–10.962) | 13.706 (13.494–13.992) | +27.6% |
-| MTP enabled | 20.012 (19.714–20.364) | 22.373 (22.173–22.551) | +11.8% |
+| Mode | Stock median (range) tok/s | Native graphs median (range) tok/s | Median change | Initial live allocation increase |
+| --- | ---: | ---: | ---: | --- |
+| MTP disabled | 10.743 (10.737–10.962) | 13.706 (13.494–13.992) | +27.6% | approximately 3.3 MiB for Q1 plans |
+| MTP enabled | 20.012 (19.714–20.364) | 22.373 (22.173–22.551) | +11.8% | approximately 32 MiB total after all tested shapes |
 
 A separate alternating native eager/graph MTP cohort gives 21.692 versus
 22.649 median tok/s (+4.4%), with wider ranges of 18.304–21.751 and
@@ -394,3 +397,126 @@ prefill, unsupported overrides, LoRA bindings and unsupported shapes fall back
 before native mutation. Cached bindings are invalidated when tensor storage or
 supported scalar attributes change. The carry ABI and graph ABI are separately
 checked, so an older extension does not silently execute the new opcode.
+
+## Release artifacts and installation
+
+- Branch: `feature/native-ir-deepseek-v41`.
+- Eager compatibility commit: `e19e0ec4050b67b49311d8064846449cac7426b1`.
+- Graph implementation commit: `81987208`.
+- Release source commit: `6f4a7208c10d36d3a32e906bb90a248c5d435fa8`.
+- Installed version: `1.6.6+nativeplan.v2.tp.moe1.ds41.1`.
+- Wheel: `D:/exllamav3/dist/native-ir-deepseek-v41/exllamav3-1.6.6+nativeplan.v2.tp.moe1.ds41.1-cp313-cp313-win_amd64.whl`.
+- Wheel SHA-256: `8cae2ec51d8a7e73276447d7cb4a970e1bd0a529f32a835439cd1e5b8950c139`.
+- Compiled architectures: sm_89 and sm_120; Python 3.13, Torch 2.9.0+cu128,
+  CUDA 12.8, MSVC 2022, compressed extension.
+
+The wheel was built with the existing project build procedure, preserving the
+exact tested extension and refreshing Python sources. ZIP payload validation
+checks every tracked packaged Python/C++/CUDA source against the committed
+checkout, and the extension against the tested binary. After `pip install
+--no-deps --force-reinstall` in `D:/tabbyAPI/venv`, every checked installed
+payload file matches the wheel byte-for-byte. Proof files are beside the release
+wheel. No dependency packages or other Python environments were modified.
+
+The installed startup proof (`installed/startup-proof.json`) confirms package
+and extension imports from Tabby's `site-packages`, normal environment-selected
+IR activation without a control toggle, 326 captures / 4902 replays, loaded
+vision, both `fp16_disk` Engram tables, and 128 exact tokens against the
+same-placement stock audit. Persistent `config.yml` and `api_tokens.yml` hashes
+remain unchanged, and the pre-existing `convert.py` matches its saved copy.
+
+The previous wheel is preserved at
+`D:/exllamav3/dist/native-ir-tp-moe-1.6.6/exllamav3-1.6.6+nativeplan.v2.tp.moe1-cp313-cp313-win_amd64.whl`
+for package rollback in the same Tabby environment. The release source commit
+above identifies the wheel's code; subsequent commits contain validation tools
+and the completed report rather than changes to that packaged code.
+
+## Installed-wheel validation
+
+The fresh installed process uses target budgets [76,46,0], yielding 26/14 target
+blocks, with all target attention still on the 6000. Two stock and two native
+1024-token audits match all target/draft output hashes, token IDs and 589/179
+acceptance; 224,460 native boundaries match exactly. This independently repeats
+the sustained correctness gate at the selected placement.
+
+The installed short-context timing cohort does **not** reproduce the earlier
+27.344 tok/s absolute rate. Its three-sample stock median is 17.951
+(15.498–19.711), native 20.412 (19.934–24.522), a 13.7% median improvement.
+Each paired native request is faster, but both paths vary considerably between
+processes and runs. No slow sample is removed from this short-context summary.
+The earlier 27.344 figure is a measured candidate-process result, not a promised
+runtime rate. The supported conclusion is a repeated same-placement IR benefit;
+precisely ranking placements under fixed clock/CPU scheduling conditions remains
+an opportunity for further investigation.
+
+At 8192 tokens, the two warmed installed samples give stock median 19.407
+(18.021–20.794), native 22.617 (19.664–25.570), +16.5%. All six outputs including
+warmup match, with 288/122 acceptance. Prefill is 3.69–3.85 seconds after warmup,
+versus approximately 15.5 seconds at the near-full baseline placement. Both
+stock and native benefit, so this is reported as a placement/environment effect,
+not an IR prefill improvement. The mechanism was not isolated with paging or
+fixed-clock measurements. Telemetry at 8K is about 89259/45285 MiB on the
+6000/4090D, providing a more balanced physical-memory margin.
+
+At 64511 tokens, the two warmed installed samples give stock median 17.812
+(17.659–17.964), native 20.280 (19.769–20.790), +13.9%. All six outputs match,
+including warmup, with 288/81 acceptance. Warmed prefill is 27.32–27.72 seconds
+in both modes, versus approximately 101 seconds at baseline placement. This
+large placement-related prefill difference is separate from native decode gain.
+
+Final live allocation is 80.344/40.307 GiB and reservation 86.482/44.293 GiB;
+request peak live allocation is 81.675/41.611 GiB on the 6000/4090D. NVML stays
+around 89261/45795 MiB through the warmed near-65K cohort. The native cache remains
+163 plans / 326 captures. Engram remains `fp16_disk`, vision and MTP stay loaded,
+and no allocation failure or continued plan growth occurs. The temporary port
+5008 validation server was stopped after the campaign; only the verified wheel
+installation remains.
+
+| Installed MTP workload, split [76,46,0] | Stock tok/s | Native tok/s | Improvement | Native VRAM cost / warmed live GiB, 6000/4090D |
+| --- | ---: | ---: | ---: | --- |
+| 177-token prompt, 3 samples | 17.951 | 20.412 | +13.7% | shared ~32 MiB footprint; 80.316 / 40.306 |
+| 8192-token prompt, 2 after warmup | 19.407 | 22.617 | +16.5% | same footprint; 80.328 / 40.307 |
+| 64511-token prompt, 2 after warmup | 17.812 | 20.280 | +13.9% | same footprint; 80.344 / 40.307 |
+
+The native tensor footprint was measured during initial shape creation at about
+32 MiB combined; it persists when switching back to stock in the same process.
+Consequently paired warmed allocation deltas are near zero and must not be
+misrepresented as zero implementation cost. CUDA graph driver allocations are
+additional and not fully isolated from other warmup allocations. Ordinary decode
+at the baseline split remains independently validated at 10.743 stock versus
+13.706 native (+27.6%); the installed selected-split timing focus is MTP.
+
+## Final diagnostic profiles
+
+Installed profiles cover generation after token 64, with complete iterate call
+scopes, and exclude exact-audit hooks. Stock ordinary HC mix/apply costs are
+2.573/0.704 s out of 19.451 s profiled host time; MTP costs are 1.251/0.348 s
+out of 9.520 s (16.8% combined). Stock MTP all-RMSNorm cost is 0.294 s.
+The native MTP profile has 6.936 s total host time and 1.728 million calls versus
+1.799 million stock; these instrumented totals are diagnostic, not throughput
+benchmarks. Some decorated forward frames still have inconsistent cumulative
+accounting, so no attention/MLP wall-time partition is inferred from those frames.
+
+Actual disk gather calls cost 0.224 s stock and 0.221 s native in matched MTP
+samples; true non-MTP gather costs are 0.347/0.348 s. Streaming was not removed.
+Tensor `.cpu()` call count stays 277, `.to()` stays 5093, and the native binding
+guard costs 0.493 s cumulative. This leaves substantial dispatch, transfer and
+readback work outside the new HC graph boundary.
+
+Matched CUDA traces cover 15 target iterations and 15 DSpark draft forwards,
+counted from first-attention-block annotations. `cudaLaunchKernel` calls fall
+from 17072 to 12557 (4515 fewer, 26.4%), while `cudaGraphLaunch` rises from 30
+to 1320. The 1290 added graph launches equal two HC stages × 43 blocks × 15
+iterations. Cooperative launches remain 2429; `cudaMemcpyAsync` remains 1591,
+stream synchronizations 86, event synchronizations 60 and device synchronizations
+four. No structural copy or synchronization elimination is claimed.
+
+Summed traced GPU kernel/copy activity is approximately 677.1 ms stock and
+540.9 ms native. Expert/GEMM activity remains dominant (roughly 60%/29% stock,
+58%/31% native); HC is about 4%. Kernel counts and numerical work are effectively
+unchanged. Timing changes in unchanged kernels, especially on the 4090D, show why
+clock/submission/profiling effects prevent treating this difference as reduced
+arithmetic. DMA activity itself is only about 5.8/5.7 ms in the trace, whereas
+host submission/readback can wait substantially longer. Native graphs address
+repeated small-kernel host submission; broader attention/state graph work remains
+outside this change.

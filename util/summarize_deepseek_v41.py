@@ -4,6 +4,7 @@ from collections import Counter,defaultdict
 import hashlib
 import json
 from pathlib import Path
+import pstats
 import statistics
 
 
@@ -11,7 +12,7 @@ def main():
     p=argparse.ArgumentParser();p.add_argument('directory',type=Path)
     p.add_argument('--skip-first',action='store_true',help='Treat round zero as context-specialization warmup')
     a=p.parse_args()
-    result={'timings':{},'traces':{},'excluded_warmup':[]}
+    result={'timings':{},'traces':{},'profiles':{},'excluded_warmup':[]}
     groups=defaultdict(list)
     for path in a.directory.glob('c*-r*-mtp*-ir*.json'):
         if any(s in path.stem for s in ('profile','trace','audit')):continue
@@ -55,11 +56,19 @@ def main():
             active[device]=(total+hi-lo)/1000
         result['traces'][path.name]=dict(kernel_and_copy_ms={k:v/1000 for k,v in categories.items()},
             counts=dict(counts),device_active_ms=active,
-            target_forwards=sum(e.get('cat')=='user_annotation' and e.get('name')=='ds41.Model.forward:text' for e in events),
-            draft_forwards=sum(e.get('cat')=='user_annotation' and e.get('name')=='ds41.Model.forward:mtp' for e in events),
+            target_forwards=(sum(e.get('cat')=='user_annotation' and e.get('name')=='ds41.Model.forward:text' for e in events)
+                or sum(e.get('cat')=='user_annotation' and e.get('name')=='ds41.DSV4Attention.forward:layers.0.attn' for e in events)),
+            draft_forwards=(sum(e.get('cat')=='user_annotation' and e.get('name')=='ds41.Model.forward:mtp' for e in events)
+                or sum(e.get('cat')=='user_annotation' and e.get('name')=='ds41.DSparkAttention.forward:mtp.0.attn' for e in events)),
             host_annotation_ms={k:v/1000 for k,v in host.items()})
+    for path in a.directory.glob('*.prof'):
+        stats=pstats.Stats(str(path))
+        rows=[dict(file=f,line=line,function=fn,calls=v[1],self_seconds=v[2],cumulative_seconds=v[3])
+              for (f,line,fn),v in stats.stats.items()]
+        result['profiles'][path.name]=dict(seconds=stats.total_tt,calls=stats.total_calls,
+            functions=sorted(rows,key=lambda r:-r['cumulative_seconds']))
     (a.directory/('summary-warmed.json' if a.skip_first else 'summary.json')).write_text(json.dumps(result,indent=2))
-    print(json.dumps({k:{key:({kk:vv for kk,vv in val.items() if kk not in ('runs','host_annotation_ms')})
+    print(json.dumps({k:{key:({kk:vv for kk,vv in val.items() if kk not in ('runs','host_annotation_ms','functions')})
                          for key,val in section.items()} for k,section in result.items() if isinstance(section,dict)},indent=2))
 
 if __name__=='__main__':main()
