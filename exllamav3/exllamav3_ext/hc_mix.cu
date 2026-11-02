@@ -1028,6 +1028,12 @@ static void hc_mix_launch
         graph->record_param(partial, GP_hc_streams, 0);
         graph->record_param(partial, GP_end, 0);
         graph->record_param(finalize, GP_hc_streams, 0);
+        if (carry) {
+            // The carried input may change storage, or switch between stream-0
+            // collapse and weighted collapse, without a new specialization.
+            graph->record_param(finalize, GP_hc_pre, 13);
+            graph->record_param(finalize, GP_hc_carry, 15, sizeof(int));
+        }
         graph->record_param(finalize, GP_end, 0);
     }
 }
@@ -1218,6 +1224,18 @@ void hc_mix_gr(const at::Tensor& streams, const at::Tensor& fn,
 {
     hc_mix_launch(streams, fn, base, scale, (float)rms_eps, (float)hc_eps,
                   (int)sinkhorn_iters, partials, &post, &comb, collapsed, graph);
+}
+
+void hc_mix_carry_gr(const at::Tensor& streams, const at::Tensor& fn,
+    const at::Tensor& base, const at::Tensor& scale, double rms_eps,
+    double hc_eps, int64_t sinkhorn_iters, at::Tensor partials, at::Tensor post,
+    at::Tensor comb, at::Tensor collapsed, const at::Tensor& pre_in,
+    at::Tensor pre_out, Graph* graph)
+{
+    const float* pre = pre_in.defined() ? (const float*)pre_in.data_ptr() : nullptr;
+    hc_mix_launch(streams,fn,base,scale,(float)rms_eps,(float)hc_eps,(int)sinkhorn_iters,
+                  partials,&post,&comb,collapsed,graph,nullptr,nullptr,
+                  pre,(float*)pre_out.data_ptr(),pre ? 1 : 2);
 }
 
 static void hc_apply_launch

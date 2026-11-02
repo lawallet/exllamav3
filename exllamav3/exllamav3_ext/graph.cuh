@@ -99,7 +99,9 @@ enum GraphedParams
     GP_moe_bias_add_weighted_weights,
 
     GP_hc_streams,
-    GP_hc_boundary
+    GP_hc_boundary,
+    GP_hc_pre,
+    GP_hc_carry
 };
 
 class Graph

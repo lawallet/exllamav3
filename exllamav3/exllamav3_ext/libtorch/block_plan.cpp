@@ -112,11 +112,12 @@ BC_BlockPlan::BC_BlockPlan(std::vector<std::vector<at::Tensor>> weights,
     // collectives stay outside these stage boundaries, and finish stays eager.
     const auto& begin_code = stages[0];
     const auto& middle_code = stages[1];
-    graph_eligible[0] = begin_code.size()==2 && begin_code[0].kernel==&BC_BlockPlan::hc &&
+    const Kernel hc_kernel = carry_mode ? &BC_BlockPlan::hc_carry : &BC_BlockPlan::hc;
+    graph_eligible[0] = begin_code.size()==2 && begin_code[0].kernel==hc_kernel &&
         begin_code[1].kernel==&BC_BlockPlan::norm && begin_code[0].site==begin_code[1].site;
     graph_eligible[1] = middle_code.size()==3 && middle_code[0].kernel==&BC_BlockPlan::apply &&
-        middle_code[1].kernel==&BC_BlockPlan::hc && middle_code[2].kernel==&BC_BlockPlan::norm &&
-        kinds[middle_code[0].site]==HC_MIX && middle_code[1].site==middle_code[2].site;
+        middle_code[1].kernel==hc_kernel && middle_code[2].kernel==&BC_BlockPlan::norm &&
+        kinds[middle_code[0].site]==(carry_mode ? HC_CARRY : HC_MIX) && middle_code[1].site==middle_code[2].site;
     if (graph_eligible[0] || graph_eligible[1]) {
         auto bind = [this](const at::Tensor& t) {
             if (t.defined()) graph_bindings.push_back({t,t.data_ptr(),t.sizes().vec(),
@@ -124,7 +125,7 @@ BC_BlockPlan::BC_BlockPlan(std::vector<std::vector<at::Tensor>> weights,
         };
         for (const auto& s:sites) {
             for (const auto& t:s.w) bind(t);
-            for (const auto& t:{s.dots,s.post,s.comb,s.mixed,s.normalized,s.output}) bind(t);
+            for (const auto& t:{s.dots,s.post,s.comb,s.mixed,s.normalized,s.output,s.pre}) bind(t);
         }
     }
 }
@@ -160,6 +161,9 @@ void BC_BlockPlan::execute_graph(size_t stage,const at::Tensor& residual,at::Ten
     auto& owned = stage_graphs[slot];
     if (!owned) owned = std::make_unique<Graph>();
     auto& graph = *owned;
+    // Keep the input alive while capture publishes the site's output. Replay
+    // patches this pointer and the scalar collapse mode on every invocation.
+    const auto carried_input = carry_output;
     // Graph callers own the eager fallback; GraphCapture/launch do not enforce
     // the upstream EXL3_GRAPHS policy themselves.
     if (graph.disabled) {
@@ -170,9 +174,14 @@ void BC_BlockPlan::execute_graph(size_t stage,const at::Tensor& residual,at::Ten
         GraphCapture capture(graph);
         for (const auto& op:stages[stage]) {
             auto& s=sites[op.site];
-            if (op.kernel==&BC_BlockPlan::hc) {
-                hc_mix_gr(residual,s.w[0],s.w[1],s.w[2],s.eps,s.hc_eps,s.iterations,
-                          s.dots,s.post,s.comb,s.mixed,&graph);
+            if (op.kernel==&BC_BlockPlan::hc || op.kernel==&BC_BlockPlan::hc_carry) {
+                if (carry_mode) {
+                    hc_mix_carry_gr(residual,s.w[0],s.w[1],s.w[2],s.eps,s.hc_eps,s.iterations,
+                                   s.dots,s.post,s.comb,s.mixed,carried_input,s.pre,&graph);
+                } else {
+                    hc_mix_gr(residual,s.w[0],s.w[1],s.w[2],s.eps,s.hc_eps,s.iterations,
+                              s.dots,s.post,s.comb,s.mixed,&graph);
+                }
                 y=s.mixed;
             } else if (op.kernel==&BC_BlockPlan::apply) {
                 hc_apply_gr(residual,y,s.post,s.comb,&graph);
@@ -191,7 +200,12 @@ void BC_BlockPlan::execute_graph(size_t stage,const at::Tensor& residual,at::Ten
     }
     args.emplace_back(GP_hc_streams,residual.data_ptr());
     args.emplace_back(GP_hc_streams,residual.data_ptr());
+    if (carry_mode) {
+        args.emplace_back(GP_hc_pre,carried_input.defined() ? carried_input.data_ptr() : nullptr);
+        args.emplace_back(GP_hc_carry,reinterpret_cast<void*>(static_cast<uintptr_t>(carried_input.defined() ? 1 : 2)));
+    }
     graph.launch(args,at::cuda::getCurrentCUDAStream().stream());
+    if (carry_mode) carry_output=sites[stages[stage].back().site].pre;
     ++graph_replays;
 }
 

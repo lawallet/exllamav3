@@ -215,6 +215,16 @@ def setup(*args, **kwargs):
         g.num_draft_tokens = 3 if body.get('mtp') else 0
         g.record_draft_stats = True
         native_plan.enabled = bool(body.get('ir',False))
+        if getattr(ext,'native_block_plan_carry_abi',None)==1:
+            from exllamav3.modules import native_deepseek_v41 as binding
+            binding.graphs_enabled=bool(body.get('graphs',False))
+            if binding.graphs_enabled:
+                assert binding.graphs_available,'carry graphs unavailable'
+            for model in (c.model,c.draft_model):
+                if model:
+                    for block in model.modules:
+                        for _,plan in getattr(block,'_native_deepseek',{}).values():
+                            plan.set_graphs(binding.graphs_enabled)
         install_audit(c,body.get('audit',False))
         state.update(jobs=[],name=body.get('name','run'),profile=body.get('profile',False),trace=body.get('trace',False))
         for i in range(torch.cuda.device_count()):

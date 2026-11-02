@@ -154,3 +154,36 @@ target blocks and checks 30,720 native boundary results against stock with the
 same inputs. MTP executes all 43 target/draft blocks and checks another 14,448
 results. Both MTP paths accept/reject 72/11 drafts in these 128-token audits.
 These instrumented timings are excluded from performance claims.
+
+## Graph implementation and validation
+
+The graph extension captures the existing HC collapse plus RMSNorm begin stage,
+and HC apply plus collapse plus RMSNorm middle stage. Attention, expert execution,
+Engram, transfers, MTP exports and finish remain in their established paths.
+It uses the existing `BC_BlockPlan` and upstream graph parameter machinery.
+Carried pre-weight pointers and the first-stream/weighted-collapse scalar mode
+are patched on every replay. Owned pre-weight outputs participate in fixed
+binding checks. This is necessary because the first block starts without a
+previous pre tensor, and later calls can change the input storage.
+
+The graph candidate passes 223 shared native tests with no failures, errors or
+skips, including both GPU architectures, dynamic carry pointer/mode transitions,
+graph opt-out and existing TP/graph policies. Actual V4.1 weights pass another
+215 specializations / 860 exact cases with graphs enabled. Two paired HTTP
+audits per MTP setting match all recorded forward inputs/output hashes, tokens,
+and draft acceptance, with 90,336 exact same-input boundary comparisons across
+all 40 target and three draft blocks (`graph-http/audit/parity.json`).
+
+Additional regression evidence: 360 Gemma actual-weight stages, 528 Devstral
+stages, generic residual primitives, and 140 Nemotron assignment/guard tests
+passed. These are targeted operation/integration checks; they do not constitute
+full generation tests of every older model. Existing older-DeepSeek TP graph
+restrictions remain intact.
+
+The eager-only candidate is not the selected performance result. It improved
+ordinary decode (10.787 to 12.377 median tok/s) but MTP samples ranged from
+17.836 to 21.921 tok/s, with a median of 18.685 versus stock 20.066. Exact outputs
+and allocator stability did not identify a correctness failure. That timing
+variation prevents recommending the eager-only change for the primary MTP
+workload. Graph and eager comparisons, device clock telemetry, longer contexts,
+and sustained generation are evaluated separately below.

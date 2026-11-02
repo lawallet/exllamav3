@@ -68,6 +68,12 @@ void hc_mix_gr(const at::Tensor& streams, const at::Tensor& fn,
     double hc_eps, int64_t sinkhorn_iters, at::Tensor partials, at::Tensor post,
     at::Tensor comb, at::Tensor collapsed, Graph* graph);
 
+void hc_mix_carry_gr(const at::Tensor& streams, const at::Tensor& fn,
+    const at::Tensor& base, const at::Tensor& scale, double rms_eps,
+    double hc_eps, int64_t sinkhorn_iters, at::Tensor partials, at::Tensor post,
+    at::Tensor comb, at::Tensor collapsed, const at::Tensor& pre_in,
+    at::Tensor pre_out, Graph* graph);
+
 void hc_apply_gr(at::Tensor x, const at::Tensor& y, const at::Tensor& post,
     const c10::optional<at::Tensor>& comb, Graph* graph);
 

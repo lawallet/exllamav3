@@ -1,5 +1,8 @@
 """Exact carried-HC stage parity, FP32 overflow protection and rejection gates."""
 import unittest
+import os
+import subprocess
+import sys
 from unittest.mock import patch
 import torch
 from exllamav3.ext import exllamav3_ext as ext
@@ -71,6 +74,50 @@ class TestCarryStages(unittest.TestCase):
             self.assertTrue(torch.equal(x,before))
         with self.assertRaises(RuntimeError):plan.begin(x)
         self.assertTrue(torch.equal(x,before))
+
+    @unittest.skipUnless(getattr(ext,'native_block_plan_carry_graph_abi',None)==1,'requires carry graph ABI')
+    def test_graph_replay_changes_carry_mode_and_storage(self):
+        for device in range(torch.cuda.device_count()):
+            for q in (1,4,5):
+                sites=self.sites(device,torch.bfloat16)
+                eager=native_plan.deepseek_carry(sites,1,q)
+                graph=native_plan.deepseek_carry(sites,1,q);graph.set_graphs(True)
+                retained=[]
+                for has_pre,dtype in ((False,torch.half),(True,torch.float),(True,torch.half),(False,torch.float)):
+                    x=torch.randn(1,q,4,5120,device=device)*100000
+                    a,b=x.clone(),x.clone()
+                    pre=torch.rand(q,4,device=device) if has_pre else None
+                    y=torch.randn(1,q,5120,device=device,dtype=dtype)
+                    retained.extend((a,b,pre,y))
+                    self.assertTrue(torch.equal(eager.begin_carry(a,pre),graph.begin_carry(b,pre)))
+                    self.assertTrue(torch.equal(eager.carry_output,graph.carry_output))
+                    self.assertTrue(torch.equal(eager.middle(a,y),graph.middle(b,y)))
+                    self.assertTrue(torch.equal(eager.carry_output,graph.carry_output))
+                    eager.finish(a,y);graph.finish(b,y)
+                    self.assertTrue(torch.equal(a,b))
+                self.assertEqual(graph.graph_captures,3)
+                self.assertEqual(graph.graph_replays,8)
+                graph.set_graphs(False)
+                self.assertTrue(torch.equal(eager.begin_carry(a,None),graph.begin_carry(b,None)))
+                self.assertEqual(graph.graph_replays,8)
+
+    @unittest.skipUnless(getattr(ext,'native_block_plan_carry_graph_abi',None)==1,'requires carry graph ABI')
+    def test_carry_global_graph_opt_out(self):
+        code='''
+import os, torch
+from tests_placeholder import TestCarryStages
+from exllamav3.modules import native_plan
+f=TestCarryStages();sites=f.sites(0,torch.half)
+p=native_plan.deepseek_carry(sites,1,1);p.set_graphs(True)
+x=torch.randn(1,1,4,5120,device=0)
+p.begin_carry(x,None)
+p.middle(x,torch.ones(1,1,5120,device=0))
+assert p.graph_captures==(2 if os.environ['EXL3_GRAPHS']=='1' else 0)
+assert p.graph_replays==p.graph_captures
+'''.replace('tests_placeholder','test_native_deepseek_v41')
+        for flag in ('0','1'):
+            subprocess.run([sys.executable,'-c',code],env=dict(os.environ,EXL3_GRAPHS=flag),check=True,
+                           stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
 
 
 if __name__=='__main__': unittest.main()

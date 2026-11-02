@@ -1,5 +1,6 @@
 """Start/benchmark/stop the isolated, authenticated Tabby validation server."""
 import argparse
+import atexit
 import hashlib
 import json
 import os
@@ -26,10 +27,13 @@ def main():
     p.add_argument('--profile',action='store_true')
     p.add_argument('--trace',action='store_true')
     p.add_argument('--audit',action='store_true')
+    p.add_argument('--graphs',action='store_true')
+    p.add_argument('--telemetry',action='store_true')
     p.add_argument('--package-root',type=Path)
     p.add_argument('--extension-dir',type=Path)
     p.add_argument('--ir',action='store_true')
     p.add_argument('--compare',action='store_true',help='Alternate stock/native with each MTP setting')
+    p.add_argument('--compare-eager',action='store_true',help='Alternate eager and graph-enabled native execution')
     p.add_argument('--mtp',choices=['both','on','off'],default='both')
     a=p.parse_args();out=a.output.resolve();out.mkdir(parents=True,exist_ok=True)
     key=yaml.safe_load((TABBY/'api_tokens.yml').read_text())['admin_key']
@@ -66,8 +70,20 @@ def main():
         import torch
         from exllamav3 import Config,Tokenizer
         tok=Tokenizer.from_config(Config.from_directory(str(TABBY/'models'/MODEL)))
+        if a.telemetry:
+            log=(out/f'telemetry-c{a.context}.csv').open('w',encoding='utf-8')
+            monitor=subprocess.Popen(['nvidia-smi','--query-gpu=timestamp,index,memory.used,utilization.gpu,clocks.sm,clocks.mem,power.draw,temperature.gpu,pstate',
+                '--format=csv','-lms','500'],stdout=log,stderr=subprocess.STDOUT,creationflags=subprocess.CREATE_NO_WINDOW)
+            def close_monitor():
+                if monitor.poll() is None:monitor.terminate();monitor.wait(timeout=10)
+                log.close()
+            atexit.register(close_monitor)
         head=tok.encode('<｜begin▁of▁sentence｜><｜User｜>Explain how computers execute programs. Use the following notes as background.\n',encode_special_tokens=True)
         filler=tok.encode('A program uses instructions, memory, data structures, functions, and operating system services.\n')
+        if a.context>1024:
+            filler=tok.encode('\n'.join(
+                f'def transform_{i}(items):\n    """Stable unique values for task {i}."""\n    return list(dict.fromkeys(items))\n'
+                for i in range(4000)))
         tail=tok.encode('\nWrite a detailed tutorial with Python examples, tracing execution, loops, memory, and common errors.<｜Assistant｜></think>',encode_special_tokens=True)
         n=a.context-head.shape[-1]-tail.shape[-1]
         assert n>=0
@@ -75,12 +91,14 @@ def main():
         text=tok.decode(ids,decode_special_tokens=True)[0]
         save('prompt.json',dict(text=text,ids=ids.tolist(),roundtrip=tok.encode(text,encode_special_tokens=True).shape[-1]))
         modes=[False,True] if a.mtp=='both' else [a.mtp=='on']
-        pairs=[(mtp,ir) for mtp in modes for ir in ([False,True] if a.compare else [a.ir])]
+        pairs=([(mtp,True,graphs) for mtp in modes for graphs in (False,True)] if a.compare_eager else
+               [(mtp,ir,a.graphs) for mtp in modes for ir in ([False,True] if a.compare else [a.ir])])
         for repeat in range(a.repeats):
-            for mtp,ir in (pairs if repeat%2==0 else list(reversed(pairs))):
+            for mtp,ir,graphs in (pairs if repeat%2==0 else list(reversed(pairs))):
                 name=f'c{a.context}-r{repeat}-mtp{int(mtp)}-ir{int(ir)}'+('-profile' if a.profile else '')+('-trace' if a.trace else '')+('-audit' if a.audit else '')
+                if a.compare_eager:name+=f'-g{int(graphs)}'
                 assert not (out/(name+'.json')).exists(),name
-                before=post('/__validation/control',dict(name=name,mtp=mtp,ir=ir,profile=a.profile,trace=a.trace,audit=a.audit))
+                before=post('/__validation/control',dict(name=name,mtp=mtp,ir=ir,profile=a.profile,trace=a.trace,audit=a.audit,graphs=graphs))
                 print('RUN',name,flush=True);start=time.perf_counter()
                 body=dict(model=MODEL,prompt=text,max_tokens=a.tokens,min_tokens=a.tokens,
                     temperature=0,top_k=1,top_p=1,min_p=0,repetition_penalty=1,

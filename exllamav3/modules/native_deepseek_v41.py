@@ -1,5 +1,6 @@
 """Guarded V4.1 carried-HC bindings. Python owns attention, Engram and MTP state."""
 import math
+import os
 import weakref
 import torch
 from . import native_plan
@@ -7,6 +8,8 @@ from .hyperconnections import HyperConnection
 from .rmsnorm import RMSNorm
 
 available = getattr(native_plan.ext, 'native_block_plan_carry_abi', None) == 1
+graphs_available = getattr(native_plan.ext, 'native_block_plan_carry_graph_abi', None) == 1
+graphs_enabled = os.environ.get('EXL3_NATIVE_DSV41_GRAPHS', '0') == '1'
 
 
 def register(model):
@@ -89,5 +92,7 @@ def get_native_block(block, x, params):
             if h.fn_h is None: h.fn_h = h.fn.half()
         return get_native_block(block,x,params)
     plan = native_plan.deepseek_carry(sites,x.shape[0],x.shape[1])
+    if graphs_available and graphs_enabled:
+        plan.set_graphs(True)
     block._native_deepseek[key] = (tuple(signature),plan)
     return plan
