@@ -1919,3 +1919,114 @@ validated product-stage runtime source; the release will reuse the byte-identica
 validated SM89/SM120 CUDA extension. The previous `.omp1` wheel remains the
 rollback artifact. Installed provenance, activation and final throughput are
 still required below before declaring delivery complete.
+
+### Packaged and installed release
+
+Implementation commit: `9a81a7017006188d5a55787b3bbf2e2e6980095c`, branch
+`feature/generation-stop-mask-cache`. The baseline branch remains at
+`68483a4b4b05b4b5ca03957ebf4a65e676bbd041`.
+
+Wheel:
+`native-results/deepseek-v41/generation-pipeline/package/wheels/exllamav3-1.6.6+nativeplan.v2.tp.moe1.ds41.1.omp1.pipe1-cp313-cp313-win_amd64.whl`
+
+SHA256: `5242505677750586fd11f89aa3988c13c0b23315f85b8cd173791c3766cddf39`.
+The established `build_py`/`bdist_wheel --skip-build` procedure reused the
+validated SM89/SM120 extension rather than recompiling unchanged CUDA code.
+Its SHA256 remains
+`12cd3cbf117c5782065651cbcafa62b7b1798178f174f57b14f46c7d715d0139`.
+Build commands and full payload hashes are in `util/package_pipeline_wheel.py`
+and `generation-pipeline/package/proof.json`.
+
+Installed only in `D:/tabbyAPI/venv` using `pip install --no-index --no-deps
+--force-reinstall` on that wheel. `package/installed-proof.json` verifies all
+647 source payload files, the binary, version and wheel, unchanged other package
+versions, unchanged persistent configuration/authentication, and preservation
+of the unrelated `convert.py` edit. The `.omp1` rollback wheel still hashes to
+`ab08485c17c5be11fb4db03f3bb2730f8e142aa1b044bbb63bb52a3220cbdc59`.
+
+Fresh installed activation/SM89/SM120 checks and environment-only end-to-end
+validation are in progress. No benchmark-control setter will activate the
+features in the final server cohorts: they must come from the process environment.
+
+### Final installed validation — complete
+
+Five fresh activation/default checks passed against the installed package.
+The 13 focused tests also passed separately on SM120 and SM89 (no skips or
+failures). The earlier full 247-test regression gate remains valid: the packaged
+runtime code is the tested product-stage code, with only the version changed.
+Cross-model checkpoint tests used that identical staged runtime and validated
+extension; they were not needlessly repeated after installing the same payload.
+
+Final fresh server cohorts used only `EXL3_STOP_MASK_CACHE` and
+`EXL3_ASYNC_DRAFT_SEED` from the environment, never the diagnostic policy setter.
+Both imported helpers and the extension resolve inside `D:/tabbyAPI/venv`.
+The short request is the same 177-token prompt, 512 generated tokens, 288/77 MTP
+counts, 26/14 placement, MTP3 and OpenMP 0 ms throughout:
+
+| Fresh process | Median tok/s | Range | Sample SD | Sample variance |
+|---|---:|---:|---:|---:|
+| Original installed `.omp1`, clean baseline-p1 | 32.902 | 32.386-33.462 | 0.46560 | 0.21678 |
+| Installed `.omp1.pipe1`, both unset | 32.954 | 32.709-33.199 | 0.17732 | 0.03144 |
+| Installed `.omp1.pipe1`, both enabled | 34.149 | 33.831-34.332 | 0.21113 | 0.04458 |
+
+Each row has five warmed measurements. The installed enabled median is +3.63%
+over the fresh new-wheel unset process and +3.79% over the clean old-wheel
+baseline. These are between-process checks, subject to absolute process
+variation. The controlled within-process product comparisons (+3.61% in the
+factorial prototype replication and +4.96% in product-p2) provide the stronger
+causal performance evidence. The previously recorded `.omp1` release median
+33.162 tok/s is also preserved; comparison to that older process is +2.98%,
+not a substitute for the matched paired evidence.
+
+Final installed populated-context checks, one measured request after a separate
+warmup each, give 8K prefill **3.8146 s**, decode **32.5501 tok/s**, and near-65K
+prefill **27.4417 s**, decode **28.5260 tok/s**. Full output vectors/MTP match the
+old release (288/122 and 288/81). These are installation checks with n=1, not
+new variance estimates; the earlier two-pair long-context comparisons measured
+about +4% decode with effectively unchanged prefill.
+
+`evidence-final.json` audits **178 V4.1 HTTP requests** across seven workload
+cohorts, all exact, with 26/14 placement, 65,536 capacity, 56 Torch threads,
+runtime OpenMP getter 0 ms, actual uncached prompt occupancy, unchanged SSD
+Engram and no increase in request-time OOM counters. The model audit retains
+519 exact old/new requests across 94 model workload cohorts. Both final server
+processes exited normally and port 5008 is free.
+
+`package/final-installed-proof.json` independently rechecks all 647 payload
+files, wheel and extension hashes, unchanged other package versions, persistent
+Tabby configuration/authentication and the unrelated edit. The initial install
+proof is retained. The baseline branch and `.omp1` rollback wheel are unchanged.
+
+Activation for the inference process (no persistent configuration change):
+
+```powershell
+$env:EXL3_NATIVE_PLAN = "1"
+$env:EXL3_OMP_BLOCKTIME_MS = "0"
+$env:EXL3_STOP_MASK_CACHE = "1"
+$env:EXL3_ASYNC_DRAFT_SEED = "1"
+```
+
+Keep target budgets `[76,46,0]`, draft `[90,0,0]` and the established MTP3/SSD
+configuration. Both new flags are independent and default off. See
+`doc/generation_pipeline.md` for ownership, fallback and per-model guidance.
+
+To repeat the installed paired benchmark, choose a new output directory:
+
+```powershell
+D:/tabbyAPI/venv/Scripts/python.exe -I util/deepseek_v41_pipeline.py --phase candidate --combined --pairs 5 --long --output native-results/deepseek-v41/generation-pipeline/repeat-paired
+```
+
+The final environment-only commands use `--phase environment
+--environment-policy unset` or `both`; the enabled installation cohort also
+used `--long`. Every cohort preserves its exact command, driver sources,
+placement, token sequences, timings and runtime state. Rollback, if desired:
+
+```powershell
+D:/tabbyAPI/venv/Scripts/python.exe -I -m pip install --no-index --no-deps --force-reinstall D:/exllamav3/native-results/deepseek-v41/omp-policy/package/wheels/exllamav3-1.6.6+nativeplan.v2.tp.moe1.ds41.1.omp1-cp313-cp313-win_amd64.whl
+```
+
+Delivery is complete. The supported recommendation is the two narrow opt-ins
+for this DeepSeek workload, approximately **3-5% additional decode throughput**
+over the OpenMP-tuned baseline, with no claim of a universal model benefit or
+of having solved the remaining TP/process variance. No broader readback,
+attention-graph, kernel, guard, numerical or storage changes were shipped.
