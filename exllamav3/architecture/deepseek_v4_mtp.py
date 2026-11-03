@@ -12,6 +12,7 @@ from ..modules.arch_specific.dspark import DSparkAttention, DSparkInputLayer, to
 from ..modules.attn import prepare_for_attn
 from ..util.device_copy import to_device
 from ..util.tensor import get_for_device
+from ..util import draft_seed
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -342,7 +343,9 @@ class DeepseekV4MTPModel(Model):
         # gemv + argmax per step, no host round trips (single sync when consumed)
         dev = self.markov_w2.device
         logits = to_dev(logits, dev)
-        seed = to_dev(params["dspark_seed_ids"], dev)
+        # The generator keeps its pinned seed unchanged through the final draft
+        # readback. Opt-in upload can overlap host submission with queued work.
+        seed = draft_seed.upload(params["dspark_seed_ids"], dev)
         if getattr(self, "_markov_w1_dev", None) is None:
             self._markov_w1_dev = to_dev(self.markov_w1.embedding.weight.data, dev)
         w2 = self.markov_w2

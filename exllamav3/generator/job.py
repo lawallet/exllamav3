@@ -16,6 +16,7 @@ from ..util.tensor import SeqTensor
 from ..tokenizer import MMEmbedding
 from functools import lru_cache
 from ..util import profile_opt
+from . import stop_mask_cache
 
 
 class NonFiniteLogits(RuntimeError):
@@ -294,6 +295,8 @@ class Job:
         self.pinned_logit_mask = None
         self.pinned_logit_bitmask = None
         self.device_logit_mask = None
+        self._stop_mask_cache = None
+        self._stop_mask_pending = None
         self.logits_device = None
 
         # Embeddings
@@ -411,6 +414,9 @@ class Job:
 
     def prepare_logit_mask(self):
 
+        if stop_mask_cache.enabled and stop_mask_cache.reuse(self):
+            return
+
         logit_mask = None
         healing = self.prefix_token is not None and self.new_tokens == -1
 
@@ -493,6 +499,9 @@ class Job:
             self.device_logit_mask = logit_mask.to(self.logits_device, non_blocking = True)
         else:
             self.device_logit_mask = None
+
+        if stop_mask_cache.enabled:
+            stop_mask_cache.remember(self)
 
 
     def constrain_output_now(self, output: str | torch.Tensor):

@@ -1469,3 +1469,453 @@ native telemetry measures **1.16 CPU cores**, while normal 56-thread CPU
 computation remains available. This supports the opt-in worker-wait policy;
 it does not justify forcing zero for all CPU-heavy workloads or claiming that
 the remaining TP/process variance has been fully explained.
+
+## Generation pipeline: investigation on the validated OpenMP baseline
+
+The next campaign starts at `68483a4b` on `feature/native-ir-deepseek-v41`,
+using the installed `.omp1` wheel and `EXL3_OMP_BLOCKTIME_MS=0`. Target budgets
+remain `[76,46,0]` (26/14 blocks), draft `[90,0,0]`, MTP3, 65,536 capacity,
+FP16 Engram SSD streaming and existing native CUDA graphs. The unrelated
+`convert.py` edit and untracked files are preserved. No runtime implementation
+changes or new feature branch have been made at this stage.
+
+Evidence and reproducible commands live under
+`native-results/deepseek-v41/generation-pipeline/`. The focused driver is
+`util/deepseek_v41_pipeline.py`. It records startup, specialization warmups,
+separate host/cProfile/CUDA profiles, and then five uninstrumented alternating
+pairs using the existing serial-readback diagnostic switch. Minimum-length
+requests are recorded separately; no change of workload is presented as a
+performance improvement. Controls use the implemented OpenMP policy, verified
+through the runtime getter, without calling the experimental setter.
+
+Source inspection: `Generator.iterate_gen` already stages independent sampled
+tokens into pinned memory, but speculative jobs inside `min_new_tokens` fall
+back to per-position `.cpu()`. `Job.prepare_logit_mask` rebuilds and uploads the
+EOS mask after accepted positions. A possible extension must prove that the mask
+stays invariant over the whole sampled window, retain the boundary fallback,
+and preserve the existing checkpoint/filter/past-ID/forced-token guards. This
+is generator-owned behavior, not an IR graph operation. Its cost under OpenMP
+0 ms is being measured before any implementation decision.
+
+### Initial OpenMP-0 readback profiles
+
+`baseline-p0/profile-masked-host.json` measures 402 CUDA token `.cpu()` calls,
+1.626 s inclusive/exclusive call envelope, in a 15.033 s instrumented steady
+window. There are also 45 CPU-identity `.cpu()` calls taking 0.000131 s, and 447
+nonblocking 258,560-byte mask uploads taking 0.0351 s of host call time. The
+unconstrained batched profile instead has 195 explicit synchronizations taking
+1.644 s in a 14.708 s window. This is **not** evidence of a 1.6 s removable
+bottleneck: batching moves the required GPU-readiness wait into a shared sync.
+The masked and unconstrained requests are distinct workloads even when tokens
+happen to match. Controlled serial/batched comparisons of the identical
+unconstrained request are running next, without instrumentation.
+
+Target-model residual exclusive time is approximately 8.4 s in these hooked
+windows, including unwrapped Python, extension dispatch and CUDA API calls;
+it is not pure interpreter cost. Native guard envelopes are 0.47 s under hooks,
+not an uninstrumented optimization estimate. CPU thread-time samples have coarse
+Windows resolution and are not used to infer individual short-call CPU costs.
+
+The CUDA trace covers about 1.51 s and records 12,557 ordinary launch calls
+(218.5 ms), 2,429 cooperative launch calls (75.2 ms), 1,320 graph launches
+(46.0 ms), 1,591 async copy calls (91.4 ms), 86 stream synchronizations
+(30.35 ms), and 60 event synchronizations (0.22 ms). Device-active unions are
+267/279 ms; these instrumented gaps do not independently distinguish Python,
+driver submission, inter-device dependencies, or OS scheduling. Existing native
+HC graphs are active. V4.1 shared-pool/index-owner/candidate attention paths
+explicitly fall outside the older whole-attention graph's ownership boundary;
+removing that guard would be incorrect. MoE expert kernels and some shared
+expert work already use bound/native execution; Python routing and layer
+coordination remain outside the carried-HC graphs.
+
+The cProfile sample records `prepare_logit_mask` at 0.2002 s cumulative over
+447 calls, including its children, and 0.0332 s self time. This must **not** be
+added to the mask upload or zero-fill times. Some Torch-wrapped function entries
+have cumulative time smaller than self time; those entries are unsuitable for
+inclusive attribution. A conservative lead is job-local reuse of an unchanged
+EOS mask, with a likely small (roughly 0-2% on this DeepSeek workload) benefit,
+subject to uninstrumented validation. This belongs in an independent generator
+helper rather than the native IR, since it controls sampling constraints and
+must work with stock execution as well.
+
+First serial/batched unconstrained pairs after tracing are nearly equal. Their
+absolute throughput is around 30 tok/s versus 33-34 before profiling; a fresh
+process that never enables profilers is required before drawing a performance
+conclusion. The post-profile cohort is retained as diagnostic evidence, not
+pooled with clean-process primary timing.
+
+### Candidate branch and architecture
+
+Created `feature/generation-stop-mask-cache` from validated `68483a4b` before
+editing runtime code. The baseline branch remains at that commit. The candidate
+is the independent `exllamav3/generator/stop_mask_cache.py` helper, enabled only
+by `EXL3_STOP_MASK_CACHE=1`, with small entry/exit hooks in
+`Job.prepare_logit_mask`. It remembers the device tensor produced by the
+unchanged mask-building code; it does not cache logits, samples, RNG state,
+acceptance decisions, or a mask across jobs.
+
+Reuse requires a nonnegative generated-token position below `min_new_tokens`,
+a nonempty unchanged stop-token list, the same vocabulary size/device/stream,
+no filters (including dormant ones), no banned strings or checkpoint, and the
+built-in sampler implementation with known built-in steps. A threshold crossing,
+rewind through a dynamic constraint, stream/device/policy change, unknown sampler,
+or CPU-only mask uses the original path. Requeue initializes a fresh cache.
+Native IR/graphs, kernels, guards, Engram and OpenMP are unchanged. The existing
+readback eligibility is deliberately unchanged: so far there is no reproducible
+post-OpenMP gain to justify extending that more delicate execution path.
+
+The uninstrumented fresh-process cohort (`baseline-p1`) returned to about
+34 tok/s during warmup/early runs, while the post-profiler cohort was around
+30 tok/s. This establishes a measurement-method limitation; it does not identify
+which profiler/runtime state caused it. Primary candidate timing will also use
+fresh processes with no profiling enabled. Candidate profiles will run separately.
+
+The clean `.omp1` readback cohort completed five alternating pairs:
+
+| Identical unconstrained workload | Median tok/s | Range | Sample SD |
+|---|---:|---:|---:|
+| Existing batched readback | 34.224 | 33.721-34.241 | 0.228 |
+| Forced serial readback | 33.940 | 33.071-34.000 | 0.467 |
+
+Median difference is +0.84%, substantially smaller than the pre-OpenMP result;
+paired gains vary and include lower-throughput serial samples. In the
+post-profile diagnostic process, batched/serial medians were 30.092/30.132
+(-0.13%). These data support retaining existing batching, but do not justify
+claiming the old 6-13% saving or extending constraint eligibility now. The
+separate clean masked workload median was 32.902 (32.386-33.462, SD 0.466).
+All 44 saved baseline requests match full token/MTP signatures in their four
+workload cohorts; the 512-token MTP workload remains 288 accepted / 77 rejected.
+
+Eleven new mask-cache regression tests pass against the isolated staged package:
+exact contents, threshold/rewind, stop-set changes, disabled behavior, job
+ownership, stream changes, CPU/unspecified-device fallback, checkpoints/banned
+strings, dormant filters/healing, unknown samplers, and seeded sampling.
+Primary alternating cache-disabled/cache-enabled end-to-end timing is running.
+
+### Pinned draft-seed upload experiment
+
+The 195 eight-byte blocking CPU-to-GPU uploads (0.3774 s in the masked host
+profile) correspond by source inspection to DSpark's `sample_from_state` seed
+transfer. `iterate_draftmodel_dflash_gen` supplies `draft_input_ids_pinned`,
+which remains unchanged until the draft results are read back. The DSpark
+`to_dev` helper currently defaults to a blocking copy even for this pinned
+source, unlike `Module.prepare_for_device` and `get_for_device`.
+
+A temporary diagnostic-only switch in `serve_deepseek_v41_pipeline.py` will
+make just pinned CPU int64 uploads through that architecture's local helper
+nonblocking. Device-to-device and pageable transfers retain the existing path.
+This is a controlled hypothesis test, not a permanent runtime change. A rotated
+2x2 comparison separates mask reuse, async seed upload, both, and neither.
+The 0.3774 s is an upper call-envelope bound, not an expected saving; required
+GPU completion may simply move to the later draft readback.
+
+First candidate process (`mask-p0`), five alternating 512-token masked MTP pairs:
+disabled median 32.928 tok/s (32.758-33.204, sample SD 0.1953, variance 0.03814);
+enabled median 33.198 (33.061-33.479, SD 0.2035, variance 0.04143), +0.82%.
+Four of five matched pairs improve. This is a small provisional result with
+overlapping ranges, not yet a release gate. Full tokens and 288/77 MTP counts
+match. Fresh-process replication and cross-model testing will determine whether
+the benefit is repeatable and useful enough to retain.
+
+The first mask process also completed ordinary generation, stock MTP and
+unconstrained controls with full parity. Those two-sample secondary controls
+are not sufficient for speedup claims. Combined baseline/candidate validation
+now covers 70 saved requests in five workload cohorts. An independent provenance
+snapshot (`generation-pipeline/environment-before.json`) verifies every installed
+`.omp1` payload, the extension, rollback-wheel checksum, package versions,
+persistent configuration hashes and the preserved `convert.py` edit.
+
+### Other submission and IR opportunities inspected
+
+The grouped target attention output projection already consolidates quantized
+short-row `wo_a` slices into one `exl3_mgemm`; treating those groups as repeated
+Python launches would overstate the remaining opportunity. V4.1 instead disables
+the existing x-side projection fan because that path includes the older
+per-head query normalization. Extending it by simply removing the guard would
+change model mathematics. The old whole-attention graph likewise excludes
+V4.1 shared-pool/index-key-owner/candidate cases. A future IR-owned projection
+or attention stage needs its own exact-operation and state-ownership design.
+The present trace demonstrates substantial remaining submission activity, but
+not a validated saving for that larger change. No attention, quantization,
+shared KV/index, or native correctness guard has been changed.
+
+Existing pinned block-table/cache-length uploads already use nonblocking
+`get_for_device` copies and reuse generator staging. Their buffer reuse relies
+on the iteration's sample-completion synchronization. Removing that dependency
+without replacing its ownership guarantee would be unsafe. The DSpark seed
+experiment uses the same established lifetime rather than globally forcing all
+copies asynchronous.
+
+The pinned-seed prototype's first three complete rounds show positive individual
+and combined effects, with exact tokens/MTP. A separate permanent candidate is
+now staged for validation: `exllamav3/util/draft_seed.py`, selected only by
+`EXL3_ASYNC_DRAFT_SEED=1`, called at the DSpark seed-upload site. It makes only
+pinned CPU int64 input asynchronous, retaining the normal safe device-copy
+helper for pageable/device/unsupported inputs. The existing generator owns this
+buffer until the final draft readback; no readback, confidence decision, or
+verification dependency is removed. This applies to the existing older V4 and
+V4.1 DSpark drafter, independently of native IR. Other architecture call sites
+are unchanged. Mask reuse and seed upload remain independently selectable.
+
+### Fresh 2x2 result: mask reuse and pinned seed upload
+
+Five rotated uninstrumented rounds in `mask-upload-p1`, each with the identical
+177-token prompt and 512 output tokens:
+
+| Mask cache | Async seed | Median tok/s | Range | Sample SD | Sample variance |
+|---|---|---:|---:|---:|---:|
+| off | off | 33.4054 | 32.6053-33.5220 | 0.37374 | 0.13968 |
+| on | off | 33.8256 | 33.5097-33.9368 | 0.15975 | 0.02552 |
+| off | on | 33.9233 | 33.4105-34.2794 | 0.33467 | 0.11200 |
+| on | on | 34.6109 | 34.4875-34.9340 | 0.18064 | 0.03263 |
+
+The median gains are +1.26%, +1.55%, and +3.61% respectively. The combined
+range does not overlap the disabled range; every round's combination improves.
+All 28 warmup/measured requests have exact complete tokens and 288/77 MTP counts.
+This establishes a worthwhile combined candidate in this process. The async
+component here is still the reversible diagnostic prototype; staged product-code
+replication, long-context, cross-model and final installed validation remain
+required before release. No improvement is attributed to GPU clock changes or
+other untested system causes.
+
+The staged product implementation (`stage-pipeline-v3`) passes all **247** native
+IR/OpenMP/pipeline regression tests, with no failures or skips, plus five fresh
+process checks for independent opt-in activation and unset/zero defaults.
+The new tests also verify pinned-vs-pageable upload dispatch, exact transferred
+tokens, identity on the destination device and custom-stream ordering.
+The broad suite retains GLM, Qwen, DeepSeek, Gemma, Devstral, TP and graph guard
+coverage. End-to-end cross-model and long-context gates are still pending.
+
+### Product-code replication (long-context cohort in progress)
+
+Fresh `product-p2`, using the staged implementation and both switches together,
+reproduces the short-context improvement over five alternating pairs:
+33.1415 -> 34.7857 tok/s (+4.96%). Disabled range 32.2653-33.3890,
+SD 0.43459/variance 0.18887; enabled range 34.6903-34.8826,
+SD 0.08173/variance 0.00668. These ranges do not overlap. All outputs/MTP match.
+
+The first two warmed 8K pairs give 31.7342 -> 33.0436 tok/s (+4.13%), with
+ranges 31.5916-31.8769 and 32.7280-33.3593 respectively. Prefill remains around
+3.7-3.8 s, separate from decode. Near-65K populated-context validation is next.
+
+The product long-context pairs completed with exact full output/MTP parity:
+
+| Context | Disabled decode median | Enabled decode median | Gain | Disabled prefill median | Enabled prefill median |
+|---|---:|---:|---:|---:|---:|
+| 8,192 populated tokens | 31.7342 tok/s | 33.0436 tok/s | +4.13% | 3.7311 s | 3.7250 s |
+| 64,511 populated tokens | 27.8104 tok/s | 28.9402 tok/s | +4.06% | 27.3868 s | 27.3957 s |
+
+Each row has two warmed alternating pairs; these smaller long-context samples
+are reported separately from the five-pair short result. The near-65K decode
+ranges are 27.6094-28.0115 disabled and 28.7567-29.1238 enabled. Prefill shows no
+material regression. The matching MTP counts are 288/122 at 8K and 288/81 near
+65K. Completed-cohort audits retain 26/14 placement, 65,536 capacity, 56 Torch
+threads, actual OpenMP 0 ms, SSD Engram mode, zero prefix-cache occupancy and
+no request-time OOMs. Full summaries are saved by `verify_pipeline_evidence.py`.
+
+Harness audit during the cross-model run found that the inherited primary-loop
+rotation followed by reversal cancels alternation for exactly two settings.
+The first Qwen process therefore used off-before-on primary pairs. Its evidence
+is retained, but a fresh corrected-order Qwen replication is required. The new
+cross-model driver now explicitly alternates the two settings; subsequent model
+processes load that corrected script. This does not affect the DeepSeek HTTP
+pairs/factorial rotation or the already-correct concurrent/long-context loops.
+
+Cross-model `qwen` completed: disabled/enabled masked decode medians 101.564/105.126 tok/s (+3.51%). Full token/MTP, EOS-boundary, seeded sampling, ordinary/stock, concurrent and cancellation checks passed. Evidence: `native-results/deepseek-v41/generation-pipeline/cross-model-v3/qwen`. This is a per-process result; uncertainty and final recommendations are assessed separately.
+
+Cross-model `glm` completed: disabled/enabled masked decode medians 56.643/58.195 tok/s (+2.74%). Full token/MTP, EOS-boundary, seeded sampling, ordinary/stock, concurrent and cancellation checks passed. Evidence: `native-results/deepseek-v41/generation-pipeline/cross-model-v3/glm`. This is a per-process result; uncertainty and final recommendations are assessed separately.
+
+GLM TP is currently slower in absolute terms than prior campaign processes,
+with both pipeline policies disabled or enabled. Prompt hashes, configuration
+hash, TP plan, placement, 56 threads, OpenMP getter values and 162/120 MTP counts
+match the earlier configuration. The cross-model launcher initially omitted
+explicit GLM/Qwen block environment flags, although `native_mode` sets them for
+every request and TP registration/export is independent of those flags. Subsequent
+processes now also set the established startup flags explicitly. TP rank graph
+execution evidence and a limited fresh `.omp1`/product primary control will be
+checked before asserting compatibility; no clock/scheduler explanation is assumed.
+
+Cross-model `glm-tp` completed: disabled/enabled masked decode medians 55.753/56.617 tok/s (+1.55%). Full token/MTP, EOS-boundary, seeded sampling, ordinary/stock, concurrent and cancellation checks passed. Evidence: `native-results/deepseek-v41/generation-pipeline/cross-model-v3/glm-tp`. This is a per-process result; uncertainty and final recommendations are assessed separately.
+
+Cross-model `nemotron` completed: disabled/enabled masked decode medians 103.225/110.956 tok/s (+7.49%). Full token/MTP, EOS-boundary, seeded sampling, ordinary/stock, concurrent and cancellation checks passed. Evidence: `native-results/deepseek-v41/generation-pipeline/cross-model-v3/nemotron`. This is a per-process result; uncertainty and final recommendations are assessed separately.
+
+The interim offline audit (`models-interim.json`) also matches completed model
+requests against retained pre-pipeline OpenMP evidence: 75 distinct workload
+cohorts, no full-token or MTP mismatch. GLM TP diagnostics contain native block
+plans and thousands of graph replays on both ranks; its lower absolute speed is
+not evidence that native TP graphs were disabled.
+
+Single secondary GLM observations were noisy: the layer-split monitored
+512-token request was 2.5% slower with caching, while TP ordinary/unmasked
+single requests were 4.9%/3.3% slower. These are not averaged into the primary
+masked results or dismissed as noise. Fresh five-pair alternating ordinary,
+unmasked and 512-token controls are queued in `mode-controls`, after the limited
+old-wheel/product TP comparison. No release decision relies on those single
+observations alone.
+
+Nemotron's separate monitored requests consumed about 1.08/0.99 CPU cores
+disabled/enabled. Blackwell median core/memory clocks were 2160/13365 MHz in
+both, VRAM usage was 67271 MiB in both, and median GPU utilization rose from
+60% to 64.5%. These correlations are consistent with reduced submission work,
+but do not establish that clocks, paging or scheduling caused the speedup.
+The uninstrumented paired measurements remain the performance evidence.
+
+Cross-model `deepseek4` completed: disabled/enabled masked decode medians 88.921/97.519 tok/s (+9.67%). Full token/MTP, EOS-boundary, seeded sampling, ordinary/stock, concurrent and cancellation checks passed. Evidence: `native-results/deepseek-v41/generation-pipeline/cross-model-v3/deepseek4`. This is a per-process result; uncertainty and final recommendations are assessed separately.
+
+Cross-model `gemma` completed: disabled/enabled masked decode medians 35.667/37.465 tok/s (+5.04%). Full token/MTP, EOS-boundary, seeded sampling, ordinary/stock, concurrent and cancellation checks passed. Evidence: `native-results/deepseek-v41/generation-pipeline/cross-model-v3/gemma`. This is a per-process result; uncertainty and final recommendations are assessed separately.
+
+Cross-model `devstral` completed: disabled/enabled masked decode medians 12.720/12.692 tok/s (-0.22%). Full token/MTP, EOS-boundary, seeded sampling, ordinary/stock, concurrent and cancellation checks passed. Evidence: `native-results/deepseek-v41/generation-pipeline/cross-model-v3/devstral`. This is a per-process result; uncertainty and final recommendations are assessed separately.
+
+### Completed cross-model primary sweep
+
+All rows use the established model-specific placement, OpenMP 0 ms and matched full output workloads. Values are tok/s; SD is sample standard deviation. Qwen is provisional pending the corrected-order fresh replication. Ordinary generation is used for Gemma/Devstral; the others use their established MTP configuration.
+
+| Model | Pairs | Disabled median (range; SD) | Enabled median (range; SD) | Median change |
+|---|---:|---|---|---:|
+| qwen | 5 | 101.564 (101.412-102.185; 0.299) | 105.126 (104.700-105.657; 0.379) | +3.51% |
+| glm | 5 | 56.643 (56.526-57.014; 0.216) | 58.195 (58.038-58.823; 0.353) | +2.74% |
+| glm-tp | 5 | 55.753 (54.464-56.301; 0.679) | 56.617 (56.218-57.803; 0.649) | +1.55% |
+| nemotron | 5 | 103.225 (102.622-105.172; 0.988) | 110.956 (110.670-111.651; 0.392) | +7.49% |
+| deepseek4 | 5 | 88.921 (86.412-92.814; 2.654) | 97.519 (93.171-98.152; 2.203) | +9.67% |
+| gemma | 3 | 35.667 (35.496-36.509; 0.542) | 37.465 (37.201-37.503; 0.164) | +5.04% |
+| devstral | 3 | 12.720 (12.692-12.734; 0.021) | 12.692 (12.626-12.735; 0.055) | -0.22% |
+
+All seven configurations passed full token/MTP, forced EOS boundary, seeded sampling, stock/native, populated-context, concurrent and cancellation comparisons. DeepSeek V4.1 retains its validated batch-one server configuration; concurrent kernel execution is covered by the other established model configurations, including older DSpark V4, native TP, and Nemotron batch three. No CPU expert offloading was introduced.
+
+The four populated-context prefill measurements per model show no material policy regression. Concurrent aggregate request throughput changed by +2.03% Qwen, +3.63% GLM, +7.17% GLM TP, +5.25% Nemotron, +6.39% V4, +0.31% Gemma and -0.27% Devstral (two warmed pairs each). These small-sample secondary results are not pooled with single-job decode. Gemma 4K decode changed -0.78%; Devstral short/long/concurrent changes are within about 1%, so no useful Devstral speedup is established.
+
+Raw per-mode medians, ranges and variances are in `model-summary-cross-complete.json`; exact cross-campaign token/MTP auditing is in `models-cross-complete.json`. The noisy GLM secondary observations remain subject to the queued fresh controls.
+
+Corrected-order fresh Qwen replication completed: five alternating pairs, 100.771 -> 103.802 tok/s (+3.01%), exact full tokens/MTP. Evidence: `generation-pipeline/qwen-order-recheck`.
+
+### Product profiling and telemetry, separate from primary timing
+
+`product-profile-p3` completed four warmed policies in forward/reverse order,
+then host/cProfile/CUDA tracing. The monitored disabled runs were
+33.136/33.048 tok/s; combined runs 34.438/34.666. Exact full tokens and 288/77
+MTP counts are unchanged. These instrumented timings support, but do not replace,
+the clean-process primary comparisons.
+
+The product host trace verifies the intended mechanism:
+
+| Steady-window operation | Disabled | Enabled | Interpretation |
+|---|---:|---:|---|
+| 258,560-byte stop-mask uploads | 447 calls, 34.81 ms host time | 0 repeated uploads | First mask is still built/uploaded normally before this window |
+| 8-byte pinned draft-seed uploads | 195 blocking calls, 377.54 ms | 195 nonblocking calls, 7.44 ms (seed-only) | Copy count/contents retained; host submission no longer waits here |
+| `prepare_logit_mask` cProfile cumulative time | 200.2 ms in the initial baseline profile | 15.48 ms, including 14.79 ms reuse validation | Inclusive values include children and must not be added to upload timings |
+
+The combined host profile still has 402 sampled-token CUDA `.cpu()` calls,
+1.463 s of call envelope. All sampled-token readbacks and decisions remain.
+Removing the seed's earlier wait can move required GPU-readiness waiting later;
+the 370 ms call-envelope difference is not a standalone speedup estimate.
+The combined hooked guard envelope is 0.494 s, and the model residual includes
+unwrapped Python, extension work and CUDA calls. Neither is pure removable
+interpreter overhead. Some Torch cProfile entries again have cumulative time
+below self time; they are excluded from inclusive attribution.
+
+The optimized CUDA sample preserves 12,557 ordinary launches, 2,429 cooperative
+launches and 1,320 graph launches. Async copies fall from 1,591 to 1,559 and
+stream synchronizations from 86 to 71 in the corresponding short sample.
+Existing native graph functionality is retained; no new graph or kernel fusion
+is claimed. GPU-active unions are about 266/260 ms over 1.49/1.47 s device spans.
+Submission-to-start delays include dependencies and previously queued work;
+they do not isolate OS scheduling delays or establish WDDM as a cause.
+
+Separate monitored decode CPU consumption is 1.175-1.185 core-equivalents
+disabled versus 1.069-1.089 combined, with all 56 Torch threads retained.
+Reported physical VRAM headroom is stable at 11,212 MiB on Blackwell and
+4,912 MiB on the model 4090D for these short requests. GPU core clocks vary
+within and between requests, and occasional page-read bursts occur in both
+policy groups; no clock or paging cause is established. Full clocks, power,
+utilization, memory, thread and process/disk counters remain in the raw telemetry.
+
+The updated offline audit covers 156 HTTP requests across seven workload
+cohorts, all exact, including the retained `.omp1` 8K/near-65K output vectors.
+Placement remains 26/14, capacity 65,536, OpenMP getter 0 ms, SSD Engram unchanged,
+and request-time OOM counters do not increase. The loader's existing initial
+allocation-probe OOM is distinguished from request-time memory stability.
+
+### Fresh Qwen and GLM TP controls
+
+Corrected Qwen primary ordering reproduced the mask benefit: disabled median
+100.771 (100.528-100.913, SD 0.154) versus enabled 103.802
+(103.484-104.508, SD 0.378), +3.01%, five alternating pairs. This supersedes
+the first Qwen process for the primary performance claim.
+
+Limited fresh GLM TP controls used the unchanged installed `.omp1` wheel and
+the identical staged product, with the established GLM/Qwen startup flags now
+explicitly present in both. Full tokens and 162/120 MTP counts match:
+
+| Process/policy | Median tok/s | Range | Sample SD |
+|---|---:|---:|---:|
+| Installed `.omp1`, five warmed controls | 84.162 | 84.028-84.366 | 0.145 |
+| Staged product, disabled, five alternating pairs | 82.326 | 81.605-83.317 | 0.655 |
+| Same product process, enabled | 85.586 | 83.559-86.577 | 1.430 |
+
+The within-product median gain is +3.96%; prefill medians are 1.2407/1.2417 s.
+The staged disabled process is 2.18% below the separate old-wheel process, so
+that cross-process difference is not described as zero overhead or ignored.
+Both fresh processes recover the prior approximate 80+ tok/s regime, ruling
+out a persistent 56 tok/s regression from the product code. The initial slow
+process and startup-flag omission remain confounded; these tests do not prove
+which condition caused the absolute difference. Earlier TP process variability
+is retained as a limitation, not attributed to clocks, WDDM or CPU scheduling.
+The queued repeated mode controls resolve the initial single-request secondary
+slowdowns before the release decision.
+
+The five-pair layer-split GLM mode controls completed: ordinary masked decode
+34.666 -> 36.256 tok/s (+4.59%), unmasked 58.835 -> 58.860 (+0.04%), and
+512-token masked 60.873 -> 62.637 (+2.90%). All outputs/MTP match; prefill
+medians remain within milliseconds. The earlier single monitored 512-token
+slowdown is not reproduced in these alternating uninstrumented comparisons.
+The corresponding native-TP mode controls are running next.
+
+### Final pre-package gates and recommendation
+
+The native-TP mode controls completed five alternating pairs per workload:
+ordinary masked 30.761 -> 31.130 tok/s (+1.20%), unmasked 56.890 -> 56.610
+(-0.49%), and 512-token masked 56.061 -> 57.261 (+2.14%). The unmasked ranges
+overlap (55.935-57.304 versus 56.271-57.050; SD 0.533/0.329), so no meaningful
+unmasked benefit or regression is established. Prefill is unchanged within the
+observed variation. All full outputs/MTP match. This slower absolute TP process
+again demonstrates why separate process rates cannot be substituted for paired
+policy comparisons.
+
+The final pre-package model audit (`models-final-prepackage.json`) checks 519
+retained/new requests across 94 workload cohorts, with no token/MTP mismatch.
+The HTTP audit separately checks 156 V4.1 requests, placement, real occupancy,
+memory and the old release's long-context vectors. EOS-boundary, seeded-sampling,
+cancellation and concurrent checks passed, as did 247 regression tests without
+skips/failures and five fresh activation/default combinations.
+
+The two small policies are worth delivering as independent opt-ins. Recommend
+both for the measured V4/V4.1 MTP workloads, with a realistic V4.1 decode benefit
+of about 3-5% and no expected prefill benefit. Mask reuse alone is useful for
+minimum-length workloads on Qwen, GLM, Nemotron and short-context Gemma; it is
+not a general unmasked-generation speedup. Leave Devstral unset unless a user's
+own workload demonstrates a benefit. Existing graph/readback eligibility and
+all numerical/native guards remain intact.
+
+Rejected/deferred work: extending speculative batched readbacks is not justified
+by the new +0.84% eligible-path comparison with overlapping variability; removing
+required GPU-readiness waits is not possible merely by relocating `.cpu()`.
+Broader V4.1 attention graph capture requires explicit shared-index/KV ownership
+work, and grouped projection dispatch is already consolidated. Guard/import
+hoisting retains the previous sub-percent opportunity rather than displacing
+these measured submission improvements. No speculative permanent changes were
+made for those candidates.
+
+Limits: these measurements cover the available Windows SM89/SM120 system and
+known checkpoint configurations, not every hardware/runtime or stochastic seed.
+V4.1 near-65K and cross-model concurrency have smaller sample counts than short
+primary decode. TP process/startup-state variance remains unresolved. GPU clocks,
+paging and scheduling telemetry are correlations; no system policy was changed.
+CPU-offload behavior was not newly introduced or inferred. Profiler perturbation
+is substantial, so all release speedup claims use uninstrumented comparisons.
+
+Release preparation uses `1.6.6+nativeplan.v2.tp.moe1.ds41.1.omp1.pipe1` on
+`feature/generation-stop-mask-cache`. Only the package version changed after the
+validated product-stage runtime source; the release will reuse the byte-identical
+validated SM89/SM120 CUDA extension. The previous `.omp1` wheel remains the
+rollback artifact. Installed provenance, activation and final throughput are
+still required below before declaring delivery complete.
