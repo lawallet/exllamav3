@@ -1,12 +1,15 @@
 # DeepSeek V4.1 native IR investigation
 
-The opt-in OpenMP policy is committed and the separately versioned
-`1.6.6+nativeplan.v2.tp.moe1.ds41.1.omp1` wheel is installed in `D:/tabbyAPI/venv`.
-Final fresh installed-wheel throughput and unset-compatibility checks have passed.
-New evidence is under `native-results/deepseek-v41/omp-policy/`; the earlier
-release wheel and all prior evidence remain preserved. The unset/default
-behavior and persistent Tabby configuration are unchanged. The entries below
-retain the investigation's intermediate findings as well as release results.
+The latest implementation is the opt-in V4.1 stateless projection graph stage,
+committed as `687fd548` on `feature/native-ir-dsv41-projection-graphs`.
+The separately versioned `1.6.6+nativeplan.v2.tp.moe1.ds41.1.omp1.pipe1.attn1`
+wheel is installed in `D:/tabbyAPI/venv`; provenance, exact parity, two fresh
+installed performance cohorts and all 254 installed regression tests pass.
+The untouched `.omp1.pipe1` baseline branch and rollback wheel are preserved.
+New evidence is under `native-results/deepseek-v41/attention-optimization/`.
+The projection flag defaults off and persistent Tabby configuration is unchanged.
+The sections below retain the earlier OpenMP and generation-pipeline findings;
+the final attention section records the current investigation and release gates.
 
 The original release follow-up reproduced 27.34 tok/s: three fresh processes give pooled native
 median 27.327 versus stock 23.427 tok/s (+16.65%), with exact paired outputs.
@@ -2030,3 +2033,491 @@ for this DeepSeek workload, approximately **3-5% additional decode throughput**
 over the OpenMP-tuned baseline, with no claim of a universal model benefit or
 of having solved the remaining TP/process variance. No broader readback,
 attention-graph, kernel, guard, numerical or storage changes were shipped.
+
+## Attention optimization: investigation from `.omp1.pipe1`
+
+Starting on validated `feature/generation-stop-mask-cache` at `cd2c44fd`, with
+implementation `9a81a701` and the installed `.omp1.pipe1` wheel. No new branch
+or permanent runtime change has been made. The unrelated `convert.py` edit,
+existing untracked files and all release artifacts remain intact. Evidence is
+kept separately in `native-results/deepseek-v41/attention-optimization/`.
+
+The primary baseline retains native IR/graphs, OpenMP 0 ms, stop-mask reuse,
+asynchronous draft seed uploads, target `[76,46,0]` (26/14), draft `[90,0,0]`,
+MTP3, 65,536 capacity and FP16 SSD Engram. No placement or system policy changes.
+
+Initial source inspection identifies a stateless boundary before positional
+rotation and all KV/index mutations: `q_a -> q_norm -> q_b`, plus independent
+`wkv`. V4.1 currently executes these as separate ordinary Linear/RMSNorm calls.
+Its separate query RoPE and weighted KV norm/RoPE must remain mathematically
+unchanged. The older x-fan restriction is retained. Grouped `wo_a` already uses
+one `exl3_mgemm`; the compressor also already consolidates its two projections
+where supported, so neither is counted as newly duplicated work.
+
+The native `BC_LinearEXL3::run_gr` wrapper currently supports graph binding only
+for one row, whereas MTP verification uses multi-row shapes. A process-local
+diagnostic can capture the existing operations to estimate end-to-end value
+before deciding whether a narrow native IR stage and multi-row graph binding
+extension are worthwhile. No shared pool, latent index, candidate, recurrent
+state or positional scalar is proposed for capture at this boundary.
+
+Targeted CPU call envelopes and sampled CUDA-event intervals are being collected
+in an isolated profile process by `util/deepseek_v41_attention.py`. CUDA-event
+intervals include submission gaps/dependencies, not just active kernel time;
+nested CPU timings are kept separate. Any candidate throughput comparisons will
+run in fresh processes without these profiling hooks.
+
+### Targeted projection evidence and reversible candidate
+
+`attention-optimization/profile-p0` completed short and near-65K profiles with
+exact output/MTP parity. All 40 target attention modules reside on logical GPU0
+under the existing shared-pool ownership, despite the unchanged 26/14 transformer
+split. Their q_a/q_b/wkv projections are all EXL3 3-bit, unpadded, unit-scaled,
+without bias. Widths are 5120->1280, 1280->32768, and 5120->512 respectively.
+The two initial sliding layers can already take the older bound whole-step
+path; the shared-pool layers do not. This is more precise than treating every
+V4.1 attention module as wholly uncaptured.
+
+Near-65K steady-window host envelopes for 7,222 calls per projection were
+367.82 ms q_a, 297.23 ms query RMSNorm, 284.03 ms q_b and 252.21 ms wkv.
+The enclosing qkv envelope is 2,014.03 ms over 7,792 calls, also including draft
+attention and the positional work; it must not be added to its children.
+Grouped output projection remains 1,189.99 ms inclusive, with wo_b 341.29 ms
+inside it. These instrumented envelopes are opportunity indicators, not
+predicted savings. Sampled CUDA event intervals also include host submission
+gaps; full per-stage/per-shape data are in `profile-p0/attention-summary.json`.
+
+The first reversible candidate (`util/deepseek_v41_projection_probe.py`) captures
+only the unchanged q_a/query-normalization/q_b/wkv calls using PyTorch CUDA
+graphs with private input/output storage. Input copying deliberately supports
+changing pointers. Original V4.1 query RoPE and weighted KV norm/RoPE execute
+after replay; all dynamic state remains outside. It is a diagnostic process
+patch, not package source or the proposed permanent architecture. Every new
+specialization compares all three projection outputs exactly on two inputs
+before timed steady-state use. Full generated sequences/MTP must also match.
+Five warmed alternating short-context pairs are running in a fresh, unprofiled
+process. A second process is required before any feature branch is created.
+
+First clean process completed (`projection-probe-p0`): baseline median
+33.8296 tok/s, range 33.4779–34.4284, sample SD 0.4283; projection capture
+35.7825 tok/s, range 35.0776–36.1160, SD 0.4081. All five matched pairs
+improved: +7.75%, +4.46%, +7.61%, +3.67%, +3.69% (paired median +4.46%).
+All complete 512-token trajectories and MTP counts matched (288 accepted,
+77 rejected). These are diagnostic-candidate results, not a released gain.
+The independent `projection-probe-p1` process repeats five short pairs and
+adds warmed 8K/near-65K pairs. Baseline branch and installed wheel remain intact.
+Reproduce with `python -I util/deepseek_v41_attention.py --phase pairs --pairs 5
+--long --output <new-directory>` in the existing TabbyAPI environment; summarize
+using `util/summarize_deepseek_v41_attention_pairs.py <directory>`.
+
+The second independent process reproduced all five short-context improvements:
+baseline median 34.6436 (33.8365–34.8400, SD 0.3991), candidate 36.4914
+(36.1920–36.5542, SD 0.1607) tok/s; paired gains +4.16% to +7.85%, median
++5.49%. Full tokens/MTP match. This met the investigation-to-development gate.
+Created `feature/native-ir-dsv41-projection-graphs` from `cd2c44fd`; the original
+branch still points to that commit. The unrelated `convert.py` edit is unchanged.
+
+The implementation adds a narrow native projection plan using existing
+`exl3_gemm_gr`, `rms_norm_gr`, `Graph` and `GraphCapture`. It owns intermediate
+storage and patches both occurrences of the external activation pointer on
+replay, avoiding the diagnostic input copy. Fixed-binding and stream guards
+remain explicit. Python retains both original V4.1 positional calls and all
+dynamic attention state. Initial activation is opt-in through
+`EXL3_NATIVE_DSV41_PROJECTIONS=1`, additionally requiring native IR, enabled
+graphs, supported K3 mul1 operands, FP16 B1/Q1–5 and SM89/SM120. Other inputs
+use the original path. This implementation still requires exact-operation,
+full-model and performance validation; diagnostic gains are not a release claim.
+
+Source-inspection correction: a stale comment in `exl3_gemm.cu` describes int8
+GEMV as uncapturable, but the actual current int8 implementation records graph
+parameters and supports capture. Its CUDA default is mode 2 when unset. The new
+plan must use the identical existing dispatcher (including that default), not
+silently switch to a different quantized activation path. Exact tests must cover
+this distinction; no quantization policy is changed by this feature.
+
+Long-context diagnostic results in `projection-probe-p1`: 8K median
+33.2383 → 34.6329 tok/s (two paired gains +3.93%, +4.46%); near-65K
+29.0834 → 30.5158 tok/s (+5.16%, +4.69%). Complete tokens and MTP counts
+match at both lengths. Prefill ranges: 8K baseline 3.6748–3.6945 s versus
+3.6757–3.6816 s; near-65K 27.4683–27.5096 s versus 27.4717–27.6044 s.
+There is no demonstrated prefill improvement or material regression.
+
+The isolated native build compiled only the two changed/new C++ translation
+units, reused the established SM89/SM120 object cache, and wrote its binary and
+Python package to `attention-optimization/native-build/stage`. The previous
+compilation cache was copied to `native-build/previous-build-cache`; old wheels
+and the installed package were not build destinations. Initial native tests:
+252 passed, no skips, including exact outputs at Q1–5 on both GPUs, changing
+activation pointers, stream isolation, operand rebinding and invalid-input
+rejection. The first full-suite invocation incorrectly forced
+`EXL3_NATIVE_PLAN=1`, routing legacy mock-only Qwen/GLM tests into real plan
+constructors (27 failures/15 errors); its logs remain preserved. Repeating with
+the suite's normal `EXL3_NATIVE_PLAN=0` restored all 252 passes. Tests that
+exercise native IR select it explicitly. No product change was made for those
+fixture failures. Explicit GEMV-mode/global-graph-policy checks follow separately.
+
+Those additional checks passed: explicit GEMV modes 0 and 1 with graphs enabled,
+and mode 2 with global graphs disabled, each at Q1/Q2/Q4 on both GPUs. The test
+compares every returned tensor exactly and checks capture counts. The native
+implementation's first primary cohort (`native-p0`, five alternating pairs)
+measured baseline 33.8567 tok/s (33.5386–34.3767, SD 0.3056), enabled 35.6222
+(34.7581–35.8328, SD 0.4941). Paired gains were +3.34%, +6.21%, +5.42%,
++2.66%, +4.24%; all complete tokens and MTP counts matched (288/77).
+152 native specializations were captured after warmup. A second fresh native
+cohort is running, with long-context validation; these are still pre-release
+results. The additional guard cost and removal of the prototype's input copy
+are included in these measurements.
+
+Second native process (`native-p1`) completed with exact full-token/MTP parity:
+
+| Context | Baseline median (range) tok/s | Native projection median (range) tok/s | Paired median gain | Samples per setting |
+|---|---:|---:|---:|---:|
+| 177 | 34.0248 (33.1919–34.3441) | 35.7967 (35.3688–35.8829) | 4.83% | 5 |
+| 8,192 | 32.5448 (32.3824–32.7073) | 34.0496 (33.9892–34.1100) | 4.63% | 2 |
+| 64,511 | 28.5805 (28.5697–28.5913) | 29.8950 (29.8503–29.9396) | 4.60% | 2 |
+
+Sample SDs baseline/enabled: short 0.4428/0.2217, 8K 0.2297/0.0854,
+near-65K 0.0153/0.0631 tok/s. Both short native cohorts have five positive
+paired gains; medians from different processes are not used as a speedup ratio.
+The new short-context token vector also exactly matches the preserved installed
+`.pipe1` vector in `generation-pipeline/installed-enabled/steady-env-r0.json`.
+BF16 norm-weight exactness and rejection of an input aliasing plan output storage
+passed on both GPUs. Full target/draft forward-hash audits are running separately;
+their instrumentation-heavy timings will not be used as performance evidence.
+
+Ownership review: the existing attention kernel consumes query/KV outputs on
+the same stream; sliding-ring updates copy KV rows into owned ring storage
+before the next invocation. Candidate selection stores derived indices, not
+borrowed projection storage. Norm-state export requests fall back when they
+name the query norm. Each native specialization has independent intermediate
+buffers, fixed-binding checks and a stream guard. No shared KV pool, latent
+index, ring, candidate list, rewind state or cross-device transfer is captured.
+
+Full forward audits passed: 58 short-context and 68 near-65K target/draft
+forward-result hashes matched exactly with capture off/on. The accompanying
+7,482 and 8,772 carried-HC checks also passed. Audit generation timing is heavily
+instrumented and is excluded from performance comparisons. Lifecycle checks
+passed with matching tokens/MTP: repeated prompts, two queued requests,
+cancellation at 13 generated tokens while the remaining job completed 64, and
+forced EOS at the minimum-length boundary (8 tokens). V4.1 retains batch one;
+the repeat-prompt case reported zero cached tokens in both modes, so this is
+not evidence of a positive prefix-cache hit. Cross-model concurrent/cache
+coverage remains necessary for the established modes that support it.
+
+The first broader sampling cohort stopped on its seeded-request comparison.
+Source inspection found that this TabbyAPI endpoint constructs `AsyncJob`
+without a `seed` argument (`backends/exllamav3/model.py`), so adding an HTTP
+`seed` field did not seed the backend. `Job` then uses `random.Random()`.
+Greedy masked/unmasked MTP pairs passed before this failure. The failed cohort
+is retained as `native-modes`; its assertion originally preceded artifact
+writing, so the failed candidate's complete sequence was not saved (server
+logs/counts are retained). The harness now saves raw results before assertions
+and has an explicit process-local seed control, recording actual backend seeds.
+`native-modes-seeded` repeats baseline/baseline/candidate/candidate seeded
+controls and completes ordinary non-MTP modes. This fixes only diagnostics;
+no persistent TabbyAPI or backend sampling implementation is changed.
+
+The corrected seeded cohort passed: baseline/baseline/candidate/candidate
+repeats all match exactly with actual backend seed 841, both with MTP (281
+accepted/120 rejected) and without it. Ordinary non-MTP masked/unmasked cases
+also passed. One seeded MTP candidate repetition slowed to 25.9327 tok/s after
+33.2039 tok/s on the preceding identical candidate request; both had the same
+152 plans/captures, identical allocated bytes and the same sampled CPU processor.
+The reservation increase was 4 MiB. That is insufficient evidence to assign a
+cause. The outlier is retained; a fresh alternating seeded telemetry cohort
+will examine reproducibility. These grouped correctness controls are not used
+as primary speedup estimates. Non-MTP correctness-run rates were 17.21–17.98
+baseline and 20.39–20.62 enabled, but no five-pair warmed non-MTP performance
+claim is made from this smaller secondary cohort.
+
+The native-stage ablation completed with three rotated rounds, all exact:
+baseline median 34.3888 tok/s, native eager 34.9254, native graph 36.0607.
+Within-round native-eager gains over baseline ranged from -0.70% to +3.74%
+(median +1.52%); this small sample does not establish a reliable eager-only gain.
+Graph replay improved over native eager in every round (about +2.23%, +5.60%,
++2.44%), and the combined stage improved over baseline by +4.00% to +6.06%.
+The diagnostic asserts that projection replay counts do not advance in eager
+mode while all existing HC/attention graphs remain enabled. This supports
+retaining selective capture instead of exposing dispatch consolidation alone;
+it does not convert nested profiler durations into a theoretical saving.
+
+### Projection telemetry and targeted trace results
+
+`native-seeded-telemetry` completed five alternating pairs with backend seed
+841 verified, exact tokens and 281/120 MTP counts throughout. Instrumented
+baseline median was 31.9807 tok/s (31.0667–32.3827, sample SD 0.5698), enabled
+33.8040 (33.5006–33.8651, SD 0.1434); paired gains 4.39–9.01%, median 5.70%.
+The earlier 25.93 tok/s seeded candidate outlier did not recur. Median sampled
+CPU consumption per run was approximately 0.99–1.12 core equivalents, with
+56 configured Torch threads. The PRO GPU's per-run median core clocks were
+2092–2152.5 MHz, memory 13365 MHz, power 126–134 W and utilization 24–29.5%.
+The Ada GPU varied between low clocks/P3 and higher-clock/P0 intervals; its
+per-run median core clocks were 465–525 MHz and power approximately 51–54 W.
+These are correlations, not established causes or fixed clock policies.
+
+The separate `native-telemetry` process was slower in both modes: short
+baseline 28.43–28.59 versus enabled 30.63–31.06 tok/s; near-65K baseline
+21.78–23.82 versus enabled 24.37–25.70. CPU remained approximately 1.01–1.10
+core equivalents, while GPU clocks/power were also lower. Prefill remained
+27.45–27.60 seconds near 65K. The following fresh profile process's clean
+warmup returned to 34.69 tok/s. These cohorts cannot separate monitoring
+overhead, process state and other environmental variance. They are preserved
+and excluded from the primary performance estimate; no CPU, clock or WDDM
+root cause is asserted. Raw samples and decode-window summaries are in each
+cohort's `telemetry/` and `telemetry-summary.json`.
+
+The baseline and candidate targeted traces completed in separate processes.
+In the same traced decode window, both execute 17,442 kernels on GPU0 and
+3,886 on GPU1. Individual kernel submission API calls fall from 16,291 to
+14,011 (14.0%): `cudaLaunchKernel` 12,557→11,189, cooperative launches
+2,429→1,517, and driver kernel launches unchanged. Graph launches rise
+1,320→1,890; node-parameter updates rise 1,207→2,213. Memcpy activity counts,
+event waits and synchronization counts are unchanged. This supports a
+submission-consolidation mechanism, not fewer numerical operations or removal
+of required synchronization. Summed GPU kernel times and execution spans
+also vary between these instrumented processes and are not interpreted as
+an isolated kernel speedup. See `native-profile-*/trace-analysis.json`.
+
+The targeted host profile records the short-context QKV envelope shrinking
+from 2.011 to 1.189 seconds, with 7,995 calls in both modes. Candidate guard
+time is 0.312 seconds and native-run time 0.230 seconds **inside** that envelope;
+they must not be added to it. Near 65K the corresponding envelope is
+1.982→1.163 seconds, guard 0.307 and native run 0.222. Output-projection
+envelopes remain approximately 1.16–1.17 seconds. Profiling hooks and sampled
+CUDA events perturb execution, and event intervals include host submission
+gaps. These quantities are diagnostic evidence, not directly removable wall
+time or a speedup forecast. The clean paired results and graph/eager ablation
+remain the evidence for retaining this candidate.
+
+Cross-model validation is running sequentially with the established checkpoint
+configurations. Qwen and GLM non-TP have completed exact ordinary/MTP,
+seeded, stop-boundary, concurrent and cancellation comparisons. Remaining
+results and release gates will be appended as they complete.
+
+### Activation, scope and reproducibility
+
+The new stage is opt-in: set `EXL3_NATIVE_DSV41_PROJECTIONS=1` before importing
+ExLlamaV3, alongside the existing `EXL3_NATIVE_PLAN=1`,
+`EXL3_OMP_BLOCKTIME_MS=0`, `EXL3_STOP_MASK_CACHE=1` and
+`EXL3_ASYNC_DRAFT_SEED=1`. CUDA graphs must remain enabled. Unset/zero keeps
+the previous projection path. No persistent TabbyAPI configuration is edited.
+Keep target budgets `[76,46,0]`, draft `[90,0,0]`, MTP3 and capacity 65,536.
+
+Initial support is intentionally narrow: V4.1's loaded K3 mul1 EXL3 operands,
+FP16 contiguous batch-one inputs, query lengths 1–5, SM89/SM120, no TP or
+LoRA/capture overrides. Unsupported models, layouts, formats and execution
+modes use the original path. The helper checks capability, norm/linear
+semantics and operand identity; native execution rechecks fixed bindings and
+stream ownership. It caches a plan per attention module, query length, device
+and stream. Prefill and dynamic attention state remain upstream-owned.
+
+Measured short-context workspace increase is 35,993,600 bytes (34.33 MiB) on
+logical GPU0 and zero on GPU1 for 152 populated specializations (38 layers ×
+four decode shapes). Longer contexts populate 154 then 156 specializations;
+allocated bytes remain constant across repeated runs within each context.
+The first two target layers retain their existing whole-step attention graph
+where that path is eligible.
+Although transformer blocks split 26/14, all 40 attention modules already
+reside on GPU0 to share their KV/index pools; this optimization preserves that
+ownership. Direct exact-operation tests cover both GPU architectures.
+
+Reproduce clean pairs with Tabby's Python, for example:
+
+```powershell
+& D:/tabbyAPI/venv/Scripts/python.exe -I util/deepseek_v41_attention.py `
+  --implemented --phase pairs --pairs 5 --long `
+  --package-dir native-results/deepseek-v41/attention-optimization/native-build/stage `
+  --output native-results/deepseek-v41/attention-optimization/NEW-UNIQUE-RUN
+```
+
+Omit `--package-dir` to validate the installed wheel. The driver records its
+full command/environment, verifies budgets/placement/runtime, alternates the
+projection flag, stores complete tokens and MTP counts, and resets requests
+consistently. `util/run_projection_validation.py` runs named diagnostic and
+cross-model cohorts sequentially; each cohort directory preserves scripts,
+metadata and raw results. Profiling and telemetry are separate phases.
+`util/build_native_projection.bat` builds the isolated extension using the
+established CUDA 12.8 / SM89+SM120 procedure; packaging verifies that its native
+sources match the tested build and that the old release wheel remains intact.
+
+The optional MTP draft-count sweep was not needed to establish this narrow
+candidate and was not performed. MTP3 remains the production recommendation.
+The ordinary-generation controls verify the new path without MTP, but are not
+a statistically sufficient independent non-MTP speedup study. No broader
+whole-attention capture, grouped-output rewrite, readback expansion or guard
+removal is included.
+
+### Cross-model release gates
+
+All seven established configurations completed exact feature-off/on controls
+with the same tested extension (`6b46a5ced9b406a664e9b67476de6d01df452c205afde8b970bb6a8908016604`).
+The records cover masked/unmasked generation, actual seeded sampling, forced
+EOS boundaries, stock/native controls, ordinary generation where an MTP model
+is available, concurrent generation and cancellation. These are compatibility
+cohorts, not long-context or five-pair cross-model performance studies.
+
+| Model | Established budget / mode | Capacity | Drafts | Saved exact controls | Concurrent requests in paired rounds |
+|---|---|---:|---:|---:|---:|
+| Qwen 3.8 Flash Next | GPU0 | 5,120 | 4 | 23 | 8 |
+| GLM-5.3 Flash | `[90,44]` | 5,120 | 3 | 23 | 8 |
+| GLM-5.3 Flash TP | Native TP, 2 GiB reserve/device | 65,536 | 3 | 23 | 8 |
+| Nemotron 3.5 Super VL | GPU0, native MoE | 32,768 | 3 | 23 | 12 |
+| Older DeepSeek V4 Flash | `[85,40]` | 8,192 | 5 | 23 | 8 |
+| Gemma 4 | `[20,40]` | 8,192 | 0 | 21 | 8 |
+| Devstral 2 | `[55,22]` | 8,192 | 0 | 21 | 8 |
+
+The new stage is ineligible on these architectures and no projection plans
+were created in the recorded local models. Existing native bindings remained
+active, including Nemotron's MoE assignment stages. GLM TP worker diagnostics
+show 45 native blocks per rank, 270 captures and 82,440 replays per rank across
+the completed controls, on both SM89 and SM120. Expected large-row TP fallbacks
+remain in place. Full vectors, counts and model-specific placements are under
+`attention-optimization/cross-model/`, with `summary.json` and TP diagnostics.
+Timing fluctuations in these no-op flag comparisons are not attributed to the
+new feature. No cross-model performance improvement is claimed.
+
+The short repeated-prompt and cross-model concurrency cohorts all reported
+zero cached tokens. The dedicated `native-prefix` V4.1 cohort closes that
+gap: initial 8K requests report zero cached tokens, and repeated requests
+reuse **8,192 cached tokens** in both modes. All 64 output tokens and 35/10
+MTP counts match exactly across feature-off/on, for both initial and repeated
+requests. The enabled stage records 152 captures and 2,204 replays. Cache
+checkpoint restoration and continued MTP generation therefore receive a
+positive reuse check, not just repeated-prompt coverage.
+
+### Attention wheel packaging and installation
+
+Implementation commit: `687fd5485eb0b4829c72eaeda367f14c3f03582e`, branch
+`feature/native-ir-dsv41-projection-graphs`. The validated baseline branch
+`feature/generation-stop-mask-cache` still points to
+`cd2c44fdaa377a5758aa6cd389c27ad85920e070`. No unrelated edits or generated
+artifacts were included in the implementation commit.
+
+New release: `1.6.6+nativeplan.v2.tp.moe1.ds41.1.omp1.pipe1.attn1`.
+Wheel: `native-results/deepseek-v41/attention-optimization/package/wheels/exllamav3-1.6.6+nativeplan.v2.tp.moe1.ds41.1.omp1.pipe1.attn1-cp313-cp313-win_amd64.whl`.
+SHA256: `915afb426995073ba75b3655945c6c824c6da4284c458cf4d91f7ce4192dd7b1`.
+Extension SHA256: `6b46a5ced9b406a664e9b67476de6d01df452c205afde8b970bb6a8908016604`.
+
+`util/package_projection_wheel.py` verifies all 363 native source files against
+the tested isolated build, packages that exact SM89/SM120 binary without a new
+compilation, and checks the wheel's committed package payload and Windows
+CPython 3.13 tag. Only the package version changed after native validation.
+Installation used `D:/tabbyAPI/venv/Scripts/python.exe -m pip install --no-deps
+--force-reinstall <new-wheel>`. `package/installed-proof.json` verifies all
+650 package payload files and the extension against the wheel, unchanged
+versions of every other installed package, unchanged persistent configuration
+and authentication hashes, and preservation of the unrelated `convert.py` edit.
+
+Rollback remains the original wheel at
+`native-results/deepseek-v41/generation-pipeline/package/wheels/exllamav3-1.6.6+nativeplan.v2.tp.moe1.ds41.1.omp1.pipe1-cp313-cp313-win_amd64.whl`,
+SHA256 `5242505677750586fd11f89aa3988c13c0b23315f85b8cd173791c3766cddf39`.
+Reinstall that file with the same Tabby venv Python and `--no-deps
+--force-reinstall` to roll back. Disabling the new projection flag also restores
+the previous projection execution path without an installation change.
+
+The fresh installed process is running five warmed alternating short pairs
+and two pairs each at 8K and near 65K, followed by the complete shared native
+IR/OpenMP/stop-mask regression suite. Its startup record now explicitly verifies
+environment-only projection activation before any diagnostic policy toggle.
+Final installed measurements and regression results will be appended below.
+
+The first installed cohort (`installed-final`) completed all clean pairs with
+exact complete token/MTP parity, also checked against the untouched old
+`.omp1.pipe1` wheel's saved short/8K/65K vectors. Actual prompt counts are
+177, 8,192 and 64,511; all generate 512 tokens with counts 288/77, 288/122 and
+288/81 respectively. This fresh process runs slower in **both** modes than
+the staged primary processes, so it is reported separately without pooling.
+
+| Installed context | Pairs | Baseline median (range) tok/s | Enabled median (range) tok/s | Baseline / enabled sample SD | Median paired gain |
+|---|---:|---|---|---|---:|
+| Short | 5 | 29.209 (28.782–29.386) | 31.365 (31.285–31.756) | 0.224 / 0.191 | +7.64% |
+| 8K | 2 | 28.064 (27.815–28.313) | 29.603 (29.564–29.642) | 0.352 / 0.055 | +5.49% |
+| Near 65K | 2 | 22.489 (22.143–22.835) | 25.905 (25.897–25.914) | 0.489 / 0.012 | +15.22% |
+
+All paired gains are positive: short 6.46–8.80%, 8K 4.42–6.57%, near-65K
+13.41–17.03%. The larger long-context gain is a two-pair observation in a slow
+process, not a general 15% performance claim. Prefill medians are 3.815→3.749
+seconds at 8K and 27.559→27.557 near 65K. Full sample variances, per-pair gains,
+memory allocations and old-wheel parity checks are in `release-comparison.json`,
+generated by the preserved `analyze-release.py` script.
+
+An additional fresh installed short cohort will retain baseline requests
+before any projection graphs exist, then run the same five alternating pairs.
+This checks reproducibility and possible baseline contamination from retained
+graph resources; it is not an attempt to select the fastest process. The first
+installed cohort and all slower observations remain part of the release record.
+
+The installed-wheel shared suite passed **254 tests, zero failures/errors/skips**
+in 51.188 seconds, using the actual Tabby site-packages and extension on both
+SM120 and SM89. It includes native block/TP/graph/architecture guards, OpenMP,
+stop-mask and the seven new projection tests. Direct projection tests cover
+Q1–5, changed input pointers, FP16/BF16 norm weights, invalid layouts/bindings,
+output alias rejection, stream ownership, operand rebinding, unsupported-mode
+fallbacks, explicit GEMV modes and global graph opt-out. The runner uses the
+suite's normal native-plan default (`EXL3_NATIVE_PLAN=0`); individual native
+tests explicitly select their intended path. Full-model benchmarks separately
+run with native IR enabled. See `package/installed-regressions.{json,log}`.
+
+`package/final-installed-proof.json` repeats the full 650-file/binary check
+after benchmarking and tests. Rollback integrity, unrelated package versions,
+persistent config/authentication hashes and the unrelated source edit still
+match the pre-install snapshot. No GPU clock, power, processor-affinity or
+system policy changes were made.
+
+### Final installed repeat and recommendation
+
+`installed-repeat` completed five further alternating pairs in a new process:
+baseline median **34.239 tok/s** (33.481–34.629, sample SD 0.473, variance
+0.22334), enabled **36.178 tok/s** (36.008–36.292, SD 0.104, variance 0.01092).
+Median **paired** gain is **5.99%**, range 3.98–8.06%; every pair is positive.
+These medians' ratio is not substituted for the median paired gain. All token
+vectors and 288/77 MTP counts match the old installed wheel as well as each
+other. Startup confirms installed package provenance and environment-only
+activation. `package/post-repeat-proof.json` verifies unchanged installation
+and rollback integrity after this final process.
+
+Three explicit baseline controls plus the first normal baseline warmup ran
+before any projection plan existed: 33.723, 34.613, 33.837 and 34.720 tok/s,
+with zero plans/captures asserted. Subsequent baseline runs retained 152 plans
+and overlap that range. This repeat does **not** reproduce the prior process's
+drop to approximately 29 tok/s following initial warmup. It therefore gives no
+evidence for a persistent baseline penalty from retaining these graphs. It
+does not establish the cause of the earlier slow process. Reproduce it with
+the installed-wheel driver command above, omitting `--long` and adding
+`--pre-capture-baselines 3`; details are in `pre-capture-control-summary.json`.
+
+Final allocation checks show identical allocated bytes across all measured
+enabled repetitions within each context, in both staged and installed cohorts.
+Short-context runs have 152 captures; 8K and near-65K settle at 154 and 156.
+These are bounded shape specializations, not per-token growth. Long-context
+prefill remains around 27.5 seconds, with exact restored-prefix and MTP state.
+
+**Retain and enable the narrow native IR projection graph stage for this
+V4.1 checkpoint.** It is the best-supported opportunity investigated here:
+small integration surface, unchanged numerical primitives, explicit ownership
+and binding guards, exact forward/generation parity and reproducible end-to-end
+gains. A conservative expectation is roughly **4–6% decode improvement** under
+the faster observed runtime states, with larger gains observed in some slower
+states. The staged five-pair medians are +4.24% and +4.83%; the two installed
+five-pair medians are +7.64% and +5.99%. Do not promise a fixed absolute rate or
+generalize the slow-process two-pair +15.22% long-context observation.
+
+This release remains opt-in with `EXL3_NATIVE_DSV41_PROJECTIONS=1`. Keep the
+existing native IR, OpenMP-zero, stop-mask and async-seed settings, target
+`[76,46,0]` (26/14 blocks), draft `[90,0,0]`, MTP3, 65,536 capacity and SSD
+Engram mode. Cross-model checks establish compatibility of the unchanged
+paths, not a benefit on other architectures. No new checkpoint downloads,
+quantization changes, CPU expert offload, persistent server changes or system
+tuning are included.
+
+Remaining limitations: absolute process variance is still unresolved;
+profiling and monitoring alter throughput; long-context timing has fewer
+repetitions than short decode; other models' controls are shorter text
+generation workloads; and this release does not claim support for other GPU
+architectures, quantized projection formats or a full-attention graph. Existing
+guards fall back outside the documented domain. Grouped output projections
+and compressor projection bundling were already consolidated upstream, so no
+duplicate implementation was added. The old per-head-normalization fan cannot
+be reused unchanged for V4.1, and dynamic KV/index/MTP operations remain outside
+capture. These negative findings should guide future work rather than repeating
+the rejected broad capture or readback experiments.

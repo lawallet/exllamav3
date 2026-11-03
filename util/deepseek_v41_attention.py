@@ -9,6 +9,8 @@ def main():
     ap=argparse.ArgumentParser();ap.add_argument('--output',type=Path,required=True)
     ap.add_argument('--phase',choices=['profile','pairs','modes','audit','lifecycle','prefix','telemetry','ablation'],default='profile')
     ap.add_argument('--pairs',type=int,default=5);ap.add_argument('--long',action='store_true')
+    ap.add_argument('--pre-capture-baselines',type=int,default=0,
+                    help='Diagnostic baseline requests before creating any projection graphs')
     ap.add_argument('--package-dir',type=Path);ap.add_argument('--implemented',action='store_true')
     ap.add_argument('--modes-tail',action='store_true',help='Skip the already-passed greedy MTP cases; repeat seeded controls')
     ap.add_argument('--seed',type=int,help='Verified backend seed for an entire paired diagnostic cohort')
@@ -96,6 +98,8 @@ def main():
                 assert after['candidate']['available'] and after['candidate']['replays']>0
                 if not native_graphs:
                     assert after['candidate']['replays']==policy['candidate']['replays'],'unwarmed ablation shape'
+            if name.startswith('pre-capture-baseline-'):
+                assert after['candidate']['plans']==0 and after['candidate']['captures']==0
             if profile:save(name+'-attention.json',get('/__attention/results'))
             print(json.dumps(dict(name=name,tps=j['new_tokens']/j['time_generate'],prefill=j['time_prefill'],accepted=j['accepted_draft_tokens'],rejected=j['rejected_draft_tokens'])),flush=True)
         if a.phase in ('lifecycle','prefix'):
@@ -145,6 +149,8 @@ def main():
                         run(f'mode-mtp{int(mtp)}-min{minimum}-seed{seed}-candidate{int(candidate)}-repeat{repeat}',
                             candidate=candidate,minimum=minimum,mtp=mtp,seed=seed)
         else:
+            for i in range(a.pre_capture_baselines):
+                run(f'pre-capture-baseline-{i}',candidate=False)
             for i in range(2):
                 for candidate in (False,True):run(f'warm-r{i}-candidate{int(candidate)}',candidate=candidate)
             for i in range(a.pairs):

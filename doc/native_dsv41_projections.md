@@ -42,8 +42,10 @@ borrowed until the next invocation of that specialization; the existing
 attention consumers finish using them on the same stream before then. Do not
 retain these buffers as new persistent attention or speculative state.
 
-On the validated V4.1 configuration, the extra steady allocation is about
-34.33 MiB on the attention GPU. Clean matched MTP3 measurements showed roughly
+On the validated V4.1 short-context configuration, the extra steady allocation
+is about 34.33 MiB on the attention GPU. Longer contexts populate a few more
+specializations; repeated runs show stable allocation within each context.
+Clean matched MTP3 measurements showed roughly
 4–5% faster decode, with exact forward outputs and token/MTP parity. The
 optimization does not target prefill. See
 [the investigation report](deepseek_v41_ir_investigation.md) for workloads,
