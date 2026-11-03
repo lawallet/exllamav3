@@ -69,6 +69,7 @@
 #include "libtorch/qwen_block.h"
 #include "libtorch/block_plan.h"
 #include "libtorch/block_plan_v2.h"
+#include "libtorch/projection_plan.h"
 #include "libtorch/native_moe_assignment.h"
 #include "libtorch/dsv4_compressor.h"
 #include "libtorch/dsv4_attn.h"
@@ -344,6 +345,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.attr("native_block_plan_v2_residual_ops") = 1;
     m.attr("native_block_plan_carry_abi") = 1;
     m.attr("native_block_plan_carry_graph_abi") = 1;
+    m.attr("native_projection_plan_abi") = 1;
+    py::class_<BC_ProjectionPlan>(m, "BC_ProjectionPlan")
+        .def(py::init<std::vector<at::Tensor>, double, int64_t>())
+        .def("run", &BC_ProjectionPlan::run)
+        .def("set_graphs", &BC_ProjectionPlan::set_graphs)
+        .def_readonly("graph_captures", &BC_ProjectionPlan::graph_captures)
+        .def_readonly("graph_replays", &BC_ProjectionPlan::graph_replays);
     py::class_<BC_BlockPlanV2>(m, "BC_BlockPlanV2")
         .def(py::init<std::vector<std::pair<int64_t,int64_t>>, std::vector<at::Tensor>,
              std::vector<std::vector<double>>, std::vector<std::vector<std::vector<int64_t>>>,

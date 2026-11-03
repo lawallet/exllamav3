@@ -19,6 +19,7 @@ from ..cache.dsa import DSV4LayerState, CacheLayer_dsa
 from .multilinear import MultiLinear
 from .attention_fn.dsa_triton import dsa_attn, dsa_indexer_scores, dsa_debug_bounds
 from .attention_fn.bc_dsa import bc_dsa_enable, build_bc_dsa, build_bc_dsa_batch
+from . import native_projection
 
 # Multi-job decode via the batched path: one projection pass, one MULTIROW attention
 # call and one grouped o_proj over all rows (per-slot state addressed through slot-id /
@@ -429,6 +430,7 @@ class DSV4Attention(Module):
         # TP import glue touch these on ranks that hold none of this layer's o_groups)
         self.tp_reduce = False
         self.tp_mode = False
+        self._native_projection_plans = {}
         self.has_split_cache = False
         self.tp_recurrent_lookup = {}
         self.tp_cache_lookup = {}
@@ -695,6 +697,7 @@ class DSV4Attention(Module):
 
     @override
     def unload(self):
+        self._native_projection_plans.clear()
         super().unload()
         for cl in self.cache_layers:
             cl.free()
@@ -990,9 +993,15 @@ class DSV4Attention(Module):
         norm (V4.1) the query is rotated on its own."""
         bsz, seq, _ = x.shape
         rd = self.rope_head_dim
-        q_res = self.q_norm.forward(self.q_a.forward(x, params), params, out_dtype = torch.half)
-        q = self.q_b.forward(q_res, params).view(bsz, seq, self.num_q_heads, self.head_dim)
-        kv = self.wkv.forward(x, params).view(bsz, seq, 1, self.head_dim)
+        plan = native_projection.get_plan(self, x, params) if native_projection.enabled else None
+        if plan is None:
+            q_res = self.q_norm.forward(self.q_a.forward(x, params), params, out_dtype = torch.half)
+            q = self.q_b.forward(q_res, params)
+            kv = self.wkv.forward(x, params)
+        else:
+            q_res, q, kv = plan.run(x)
+        q = q.view(bsz, seq, self.num_q_heads, self.head_dim)
+        kv = kv.view(bsz, seq, 1, self.head_dim)
         if not self.q_head_norm:
             _ext_rope(q[..., -rd:], self._rope_type(), position, positions = positions)
             ext.rope(

@@ -20,6 +20,11 @@ RES_ADD_NORM, RES_ADD = 7, 8
 v2_residual_available = v2_available and getattr(ext, 'native_block_plan_v2_residual_ops', None) == 1
 
 
+def projections(weights, epsilon, query):
+    """Stateless linear/norm/linear plus input projection; dynamic state stays outside."""
+    return ext.BC_ProjectionPlan(weights, epsilon, query)
+
+
 def devstral(norms, batch, query):
     """Pre-norm residual plumbing around two Python sublayers."""
     return ext.BC_BlockPlanV2(
