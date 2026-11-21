@@ -3,11 +3,8 @@ from collections import deque
 import torch
 import gc
 import sys
+import os
 from pydantic import PydanticUserError
-
-# @lru_cache
-# def init_pynvml():
-#     pynvml.nvmlInit()
 
 # Try to make sure device is live for correct measurement of free VRAM
 def touch_device(device: int):
@@ -30,12 +27,23 @@ def is_integrated_device(device) -> bool:
 
 def device_mem_info(device) -> tuple[int, int]:
     """(free, total) bytes for device. On an integrated GPU, CUDA's free figure is the host's
-    MemFree, which leaves out reclaimable page cache, so use MemAvailable instead"""
+    MemFree, which leaves out reclaimable page cache, so use MemAvailable instead.
+    With EXL3_WDDM_MEMORY=1 on WDDM, prefer UUID-mapped physical headroom: CUDA's free reading can fall
+    when a different GPU fills, despite this GPU still accepting allocations.
+    Both allocator limits and autosplit transient checks use this helper.
+    """
     free, total = torch.cuda.mem_get_info(device)
     if is_integrated_device(device):
         available = host_memory_available()
         if available is not None:
             free = min(max(free, available), total)
+    elif sys.platform == "win32" and os.environ.get("EXL3_WDDM_MEMORY") == "1":
+        from .wddm_memory import physical_free_memory
+        physical = physical_free_memory(
+            torch.cuda.get_device_properties(device), total, torch.cuda.memory_reserved(device)
+        )
+        if physical is not None:
+            free = physical
     return free, total
 
 
